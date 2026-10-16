@@ -1,15 +1,6 @@
 # DockerIX
 
-RISC iX 1.21c, Acorn's 1990 BSD Unix for the Archimedes, running headless in
-a Docker container under [Arculator](https://b-em.bbcmicro.com/arculator) and
-driven from the host. `dockerix start` builds the image and boots RISC iX to
-its login prompt with nothing typed into the emulator; `dockerix exec` runs a
-command in the guest with a directory of yours shared as its work area,
-pushed as a delta before each command or, with `--nfs`, mounted live;
-`dockerix login` gives a shell, `get`/`put` copy files either way, and the
-guest's X11 clients can display on the host. It runs on Apple Silicon Macs
-and amd64 Linux, and needs Docker and either a release binary or a Rust
-toolchain.
+Simple tool to use Acorn RISC iX within a Docker container. Build and test RISC iX software using modern development workflows. Integrate RISC iX as a container into your Docker environments.
 
 ```
 $ cd workarea/hello
@@ -25,6 +16,19 @@ RISC iX riscix 1.2 1c arm
 # date
 Thu Oct 15 23:32:07 GMT0BST 2026
 ```
+
+
+RISC iX 1.21c, Acorn's 1990 BSD Unix for the Archimedes, running headless in
+a Docker container under [Arculator](https://b-em.bbcmicro.com/arculator) and
+driven from the host. `dockerix start` builds the image and boots RISC iX to
+its login prompt with nothing typed into the emulator; `dockerix exec` runs a
+command in the guest with a directory of yours shared as its work area,
+pushed as a delta before each command or, with `--nfs`, mounted live;
+`dockerix login` gives a shell, `get`/`put` copy files either way, and the
+guest's X11 clients can display on the host. It runs on Apple Silicon Macs
+and amd64 Linux, and needs Docker and either a release binary or a Rust
+toolchain.
+
 
 ## Installing
 

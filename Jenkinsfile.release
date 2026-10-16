@@ -2,9 +2,11 @@
 // each platform and attach both, with their checksums, to a GitHub Release
 // of that tag.
 //
-// A second multibranch job points at this file: tags only, name filter
-// `v.*`, and the `dockerix-release-token` credential (a fine-grained token
-// with contents read/write on the repository) bound as a string credential.
+// A second multibranch job points at this file: tags only, with the Tags
+// build strategy, a name filter of `v*` (the wildcard filter; `v.*` for
+// the regular-expression one), and the `dockerix-release-token` credential
+// (a fine-grained token with contents read/write on the repository) bound
+// as a string credential.
 // The branch job (Jenkinsfile) discovers branches only, so the two never
 // see the same ref. Each agent needs the Rust toolchain and `gh` on PATH.
 // The tag must be `v` + the version in cli/Cargo.toml.
