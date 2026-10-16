@@ -1,5 +1,7 @@
 # DockerIX
 
+[![CI](https://github.com/hungryhorace/dockerix/actions/workflows/ci.yml/badge.svg)](https://github.com/hungryhorace/dockerix/actions/workflows/ci.yml)
+
 Simple tool to use Acorn RISC iX within a Docker container. Build and test RISC iX software using modern development workflows. Integrate RISC iX as a container into your Docker environments.
 
 ```
