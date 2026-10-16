@@ -1,0 +1,663 @@
+diff --git a/Makefile.in b/Makefile.in
+index 4ac6283..8b1b4f5 100644
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -85,7 +85,7 @@ include site.mk
+
+ SHELL = /bin/bash
+
+-SRCS		= version.c logging.c fh.c devtab.c \
++SRCS		= version.c logging.c fh.c efsdir.c devtab.c \
+ 		  auth_init.c auth_clnt.c auth.c \
+ 		  nfsd.c nfs_dispatch.c getattr.c setattr.c \
+ 		  mountd.c mount_dispatch.c \
+@@ -110,7 +110,7 @@ MANPAGES	= $(MANPAGES5) $(MANPAGES8p) $(MANPAGES8)
+ LIBOBJS		= version.o fsusage.o mountlist.o xmalloc.o xstrdup.o \
+ 		  nfsmounted.o haccess.o failsafe.o \
+ 		  signals.o @LIBOBJS@ @ALLOCA@
+-OBJS		= logging.o fh.o devtab.o auth_init.o auth_clnt.o auth.o
++OBJS		= logging.o fh.o efsdir.o devtab.o auth_init.o auth_clnt.o auth.o
+ NFSD_OBJS	= nfsd.o rpcmisc.o nfs_dispatch.o getattr.o setattr.o \
+ 		  nfs_prot_xdr.o ugid_clnt.o ugid_map.o ugid_xdr.o $(OBJS)
+ MOUNTD_OBJS	= mountd.o rpcmisc.o mount_dispatch.o mount_xdr.o rmtab.o \
+diff --git a/efsdir.c b/efsdir.c
+new file mode 100644
+index 0000000..27fbe27
+--- /dev/null
++++ b/efsdir.c
+@@ -0,0 +1,241 @@
++/*
++ * efsdir.c	Directory streams with dependable positions.
++ *
++ * The server used to hand telldir() positions to clients as READDIR
++ * cookies and seekdir() back to them on the next call, on a freshly
++ * opened stream. Neither holds on a modern host: ext4 and overlayfs give
++ * 64-bit hash positions that a 32-bit NFSv2 cookie truncates, and a
++ * FUSE/virtiofs mount (a Docker Desktop bind mount) ignores the seek and
++ * starts again at the first entry, so a client asking for the rest of a
++ * directory gets the start of it again, for ever. fh_buildpath() walks
++ * directories the same way, and loops for ever on such a mount when it
++ * has to backtrack.
++ *
++ * An EFS_DIR is instead the whole directory read into memory when it is
++ * opened, "." and ".." first (as a client expects a listing to begin),
++ * and a position is simply the number of entries read so far. Those
++ * positions are small, fit any cookie, and mean the same thing to every
++ * stream on the same directory contents.
++ */
++
++#include "nfsd.h"
++
++struct efs_dirent {
++	ino_t		ino;
++	char *		name;
++};
++
++struct efs_dir {
++	struct efs_dirent *	ents;
++	long			count;
++	long			pos;
++	struct dirent		cur;	/* what efs_readdir() returns */
++};
++
++static int
++is_dot(const char *name)
++{
++	return name[0] == '.' && name[1] == '\0';
++}
++
++static int
++is_dotdot(const char *name)
++{
++	return name[0] == '.' && name[1] == '.' && name[2] == '\0';
++}
++
++/* Sort rank: "." first, ".." second, the rest in directory order. */
++static int
++rank(const char *name)
++{
++	return is_dot(name) ? 0 : is_dotdot(name) ? 1 : 2;
++}
++
++void
++efs_closedir(EFS_DIR *d)
++{
++	long	i;
++
++	if (d == NULL)
++		return;
++	for (i = 0; i < d->count; i++)
++		free(d->ents[i].name);
++	free(d->ents);
++	free(d);
++}
++
++EFS_DIR *
++efs_opendir(const char *path)
++{
++	DIR		*dir;
++	struct dirent	*dp;
++	EFS_DIR		*d;
++	long		cap = 0, i, j;
++	int		err;
++
++	if ((dir = opendir(path)) == NULL)
++		return NULL;
++	if ((d = calloc(1, sizeof(*d))) == NULL) {
++		closedir(dir);
++		errno = ENOMEM;
++		return NULL;
++	}
++	for (;;) {
++		errno = 0;
++		if ((dp = readdir(dir)) == NULL)
++			break;
++		if (d->count == cap) {
++			struct efs_dirent *n;
++
++			cap = cap ? 2 * cap : 64;
++			n = realloc(d->ents, cap * sizeof(*n));
++			if (n == NULL) {
++				errno = ENOMEM;
++				break;
++			}
++			d->ents = n;
++		}
++		d->ents[d->count].ino = dp->d_ino;
++		if ((d->ents[d->count].name = strdup(dp->d_name)) == NULL) {
++			errno = ENOMEM;
++			break;
++		}
++		d->count++;
++	}
++	err = errno;
++	closedir(dir);
++	if (err != 0) {
++		efs_closedir(d);
++		errno = err;
++		return NULL;
++	}
++
++	/* Stable insertion of "." and ".." at the front. */
++	for (i = 1; i < d->count; i++) {
++		struct efs_dirent e = d->ents[i];
++		int r = rank(e.name);
++
++		if (r == 2)
++			continue;
++		for (j = i; j > 0 && rank(d->ents[j - 1].name) > r; j--)
++			d->ents[j] = d->ents[j - 1];
++		d->ents[j] = e;
++	}
++	return d;
++}
++
++struct dirent *
++efs_readdir(EFS_DIR *d)
++{
++	struct efs_dirent *e;
++
++	if (d->pos >= d->count)
++		return NULL;
++	e = &d->ents[d->pos++];
++	memset(&d->cur, 0, sizeof(d->cur));
++	d->cur.d_ino = e->ino;
++	strncpy(d->cur.d_name, e->name, sizeof(d->cur.d_name) - 1);
++	return &d->cur;
++}
++
++long
++efs_telldir(EFS_DIR *d)
++{
++	return d->pos;
++}
++
++void
++efs_seekdir(EFS_DIR *d, long pos)
++{
++	d->pos = (pos < 0) ? 0 : (pos > d->count) ? d->count : pos;
++}
++
++/*
++ * The inode numbers directories list for their entries, which path_psi()
++ * (fh.c) uses as a file's identity. A request may ask about the same
++ * directory several times, so its listings are kept for the rest of that
++ * request (efs_request_begin() starts each one), and no longer: a
++ * directory's times cannot say when a listing has gone out of date,
++ * since a Docker Desktop bind mount never updates the container's view
++ * of a directory's times for changes made on the Mac. A process without
++ * requests (mountd) reads every listing afresh.
++ */
++#define INO_CACHE	8
++
++static struct inosnap {
++	char *		path;
++	dev_t		dev;
++	unsigned long	gen;
++	EFS_DIR *	dir;
++	unsigned long	used;
++} ino_cache[INO_CACHE];
++static unsigned long	ino_clock;
++static unsigned long	ino_gen;
++
++void
++efs_request_begin(void)
++{
++	if (++ino_gen == 0)
++		ino_gen = 1;
++}
++
++static int
++find_name(EFS_DIR *d, const char *name, ino_t *ino)
++{
++	long	i;
++
++	for (i = 0; i < d->count; i++) {
++		if (strcmp(d->ents[i].name, name) == 0) {
++			*ino = d->ents[i].ino;
++			return 1;
++		}
++	}
++	return 0;
++}
++
++int
++efs_dirent_ino(const char *dir, const struct stat *dirst,
++		const char *name, ino_t *ino)
++{
++	struct inosnap	*s, *slot = NULL;
++	EFS_DIR		*d;
++	char		*path;
++	int		i;
++
++	for (i = 0; i < INO_CACHE; i++) {
++		s = &ino_cache[i];
++		if (s->path != NULL && strcmp(s->path, dir) == 0) {
++			slot = s;
++			break;
++		}
++		if (slot == NULL || (slot->path != NULL
++		 && (s->path == NULL || s->used < slot->used)))
++			slot = s;
++	}
++	if (slot->path != NULL && strcmp(slot->path, dir) == 0
++	 && slot->dev == dirst->st_dev
++	 && ino_gen != 0 && slot->gen == ino_gen) {
++		slot->used = ++ino_clock;
++		if (find_name(slot->dir, name, ino))
++			return 0;
++	}
++
++	if ((d = efs_opendir(dir)) == NULL)
++		return -1;
++	if ((path = strdup(dir)) == NULL) {
++		efs_closedir(d);
++		errno = ENOMEM;
++		return -1;
++	}
++	free(slot->path);
++	efs_closedir(slot->dir);
++	slot->path = path;
++	slot->dev = dirst->st_dev;
++	slot->gen = ino_gen;
++	slot->dir = d;
++	slot->used = ++ino_clock;
++	if (find_name(d, name, ino))
++		return 0;
++	errno = ENOENT;
++	return -1;
++}
+diff --git a/extensions.h b/extensions.h
+index 4b9abbd..922ab2b 100644
+--- a/extensions.h
++++ b/extensions.h
+@@ -29,11 +29,21 @@
+ #define efs_write	write
+ #define efs_lseek	lseek
+
+-#define efs_opendir	opendir
+-#define efs_readdir	readdir
+-#define efs_closedir	closedir
+-#define efs_seekdir	seekdir
+-#define efs_telldir	telldir
++/* Directory streams read into memory, with positions that survive a
++ * close and reopen (efsdir.c): libc's telldir/seekdir positions do not. */
++typedef struct efs_dir	EFS_DIR;
++extern EFS_DIR		*efs_opendir(const char *path);
++extern struct dirent	*efs_readdir(EFS_DIR *dir);
++extern void		efs_closedir(EFS_DIR *dir);
++extern void		efs_seekdir(EFS_DIR *dir, long pos);
++extern long		efs_telldir(EFS_DIR *dir);
++/* Start of an NFS request: forget the listings efs_dirent_ino() kept. */
++extern void		efs_request_begin(void);
++/* The inode number DIR (whose lstat() is DIRST) lists for NAME: 0, or -1
++ * with errno set. Listings are cached until the next efs_request_begin(). */
++extern int		efs_dirent_ino(const char *dir,
++				const struct stat *dirst,
++				const char *name, ino_t *ino);
+
+ #define efs_stat	stat
+ #define efs_fstat	fstat
+diff --git a/fh.c b/fh.c
+index e7a2058..814891c 100644
+--- a/fh.c
++++ b/fh.c
+@@ -561,7 +561,7 @@ fh_buildpath(svc_fh *h)
+ 	strcpy(pathbuf, "/");
+ 	cookie_stack[2] = 0;
+ 	for (i = 2; i <= h->hash_path[0] + 1; i++) {
+-		DIR *dir;
++		EFS_DIR *dir;
+ 		struct dirent *dp;
+
+ 	backtrack:
+@@ -735,10 +735,25 @@ fh_buildpath(svc_fh *h)
+ }
+ #endif
+
++/*
++ * A file's pseudo inode: the inode number its parent directory lists for
++ * it, with the parent's device, rather than what lstat() says. The two
++ * agree on an ordinary disc but not on a Docker Desktop bind mount
++ * (FUSE/virtiofs). There readdir() gives the Mac's inode numbers, which
++ * last, while lstat() gives numbers the FUSE server deals out in lookup
++ * order and deals out afresh once the kernel has forgotten a file: a
++ * handle made from them goes stale at random, and fh_buildpath(), which
++ * matches readdir() numbers, never finds it again. A mount point was
++ * always identified this way, since its parent lists the covered
++ * directory. Only "/" has no parent to ask.
++ */
+ static psi_t
+ path_psi(char *path, nfsstat *status, struct stat *sbp, int svalid)
+ {
+-	struct stat sbuf;
++	struct stat	sbuf, ddbuf;
++	char		*dname, *fname;
++	ino_t		ino;
++	int		rc;
+
+ 	if (sbp == NULL)
+ 		sbp = &sbuf;
+@@ -746,77 +761,28 @@ path_psi(char *path, nfsstat *status, struct stat *sbp, int svalid)
+ 		*status = nfs_errno();
+ 		return (0);
+ 	}
+-	if (S_ISDIR(sbp->st_mode) && strcmp(path, "/") != 0) {
+-		/* Special case for directories--test for mount point. */
+-		struct stat ddbuf;
+-		char *fname;
+-
+-		/* Find start of last component of path. */
+-#if 1
+-		char	*dname = path;
+-
+-		if ((fname = strrchr(dname, '/')) == dname) {
+-			dname = "/";
+-		}
+-		*fname++ = '\0';
+-		if (efs_lstat(dname, &ddbuf) < 0) {
+-			fname[-1] = '/';
+-			*status = nfs_errno();
+-			return (0);
+-		}
+-#else
+-		if ((sindx = strrchr(path, '/')) == path) {
+-			sindx++;
+-			fname = sindx;
+-		} else
+-			fname = sindx + 1;
+-
+-		/* Remove last element of path. */
+-		squirrel = *sindx;
+-		*sindx = '\0';
+-		if (efs_lstat(path, &ddbuf) < 0) {
+-			*sindx = squirrel;
+-			*status = nfs_errno();
+-			return (0);
+-		}
+-#endif
+-		/* fname now points to directory entry name. */
+-		if (ddbuf.st_dev == sbp->st_dev) {
+-			fname[-1] = '/';	/* Restore path */
+-		} else {
+-			/* Directory is a mount point. */
+-			DIR *dirp;
+-			struct dirent *dp;
+-
+-			errno = 0;
+-			dirp = efs_opendir(dname);
+-			fname[-1] = '/';	/* Restore path */
+-
+-			if (dirp == NULL) {
+-				if (errno == EACCES)
+-					goto unreadable;
+-				if (errno != 0)
+-					*status = nfs_errno();
+-				else
+-					*status = NFSERR_NOENT;
+-			} else {
+-				*status = NFS_OK;
+-				do {
+-					if ((dp = efs_readdir(dirp)) == NULL) {
+-						*status = NFSERR_NOENT;
+-						efs_closedir(dirp);
+-						return (0);
+-					}
+-				} while (strcmp(fname, dp->d_name) != 0);
+-				sbp->st_dev = ddbuf.st_dev;
+-				sbp->st_ino = dp->d_ino;
+-				efs_closedir(dirp);
+-			}
+-		}
+-	unreadable:
+-		;
++	if (strcmp(path, "/") == 0)
++		return (pseudo_inode(sbp->st_ino, sbp->st_dev));
++
++	/* Split off the last component of path. */
++	dname = path;
++	if ((fname = strrchr(dname, '/')) == dname)
++		dname = "/";
++	*fname++ = '\0';
++	rc = efs_lstat(dname, &ddbuf);
++	if (rc == 0)
++		rc = efs_dirent_ino(dname, &ddbuf, fname, &ino);
++	fname[-1] = '/';	/* Restore path */
++	/* A parent that cannot be listed: lstat()'s number will have to do. */
++	if (rc < 0 && errno == EACCES)
++		return (pseudo_inode(sbp->st_ino, sbp->st_dev));
++	if (rc < 0) {
++		*status = (errno != 0) ? nfs_errno() : NFSERR_NOENT;
++		return (0);
+ 	}
+-	return (pseudo_inode(sbp->st_ino, sbp->st_dev));
++	sbp->st_dev = ddbuf.st_dev;
++	sbp->st_ino = ino;
++	return (pseudo_inode(ino, ddbuf.st_dev));
+ }
+
+ fhcache *
+@@ -860,22 +826,15 @@ fh_find(svc_fh *h, int mode)
+ 			struct stat	*s = &fhc->attrs;
+ 			psi_t		psi;
+ 			nfsstat		dummy;
++			char		*npath;
+
+ 			if (efs_lstat(fhc->path, s) < 0) {
+ 				Dprintf(D_FHTRACE,
+ 					"fh_find: stale fh: lstat: %m\n");
+ 			} else {
+ 				fhc->flags |= FHC_ATTRVALID;
+-				/* If pseudo-inos don't match, we fhc->path
+-				 * may be a mount point (hence lstat() returns
+-				 * a different inode number than the readdir()
+-				 * stuff used in path_psi)
+-				 */
+-				psi = pseudo_inode(s->st_ino, s->st_dev);
+-				if (h->psi == psi)
+-					goto fh_return;
+-
+-				/* Try again by computing the path psi */
++				/* Only path_psi() says who the file is:
++				 * lstat()'s inode number need not be it. */
+ 				psi = path_psi(fhc->path, &dummy, s, 1);
+ 				if (h->psi == psi)
+ 					goto fh_return;
+@@ -884,6 +843,26 @@ fh_find(svc_fh *h, int mode)
+ 					"dev/ino %x/%lx psi %lx",
+ 					s->st_dev, s->st_ino,
+ 					(unsigned long) psi);
++
++				/* Another file has the handle's path now. If
++				 * the handle's own file was moved, follow it.
++				 * If it is gone, the file at the path took its
++				 * place, and the handle names that: an editor
++				 * on the Mac that saves by writing a new file
++				 * and renaming it over the old one should look
++				 * to the guest like a rewrite, not a stale
++				 * handle (the guest keeps using the old handle
++				 * while the directory looks unchanged to it,
++				 * and the bind mount never shows it changed).
++				 * Either way the cached fd is the old file's. */
++				fh_close(fhc);
++				if ((npath = fh_buildpath(h)) != NULL) {
++					free(fhc->path);
++					fhc->path = npath;
++					if (efs_lstat(fhc->path, s) < 0)
++						fhc->flags &= ~FHC_ATTRVALID;
++				}
++				goto fh_return;
+ 			}
+
+ 		fh_discard:
+diff --git a/nfs_dispatch.c b/nfs_dispatch.c
+index abca059..e0b18b6 100644
+--- a/nfs_dispatch.c
++++ b/nfs_dispatch.c
+@@ -162,6 +162,7 @@ nfs_dispatch(struct svc_req *rqstp, SVCXPRT *transp)
+
+ 	/* Do the function call itself. */
+ 	nfs_dispatch_time = time(NULL);
++	efs_request_begin();
+ 	result.nfsstat = (*dent->funct) (&argument, rqstp);
+ 	Dprintf(D_CALL, "result: %d\n", result.nfsstat);
+
+diff --git a/nfsd.c b/nfsd.c
+index b0ec7e4..da981ab 100644
+--- a/nfsd.c
++++ b/nfsd.c
+@@ -851,19 +851,91 @@ dpsize(struct dirent *dp)
+ 	return (sizeof(entry) + NLENGTH(dp) + DP_SLOP);
+ }
+
++/*
++ * A READDIR cookie is the number of entries the client has had so far
++ * (efsdir.c), so the rest of a listing must come from the directory as it
++ * was when the listing began: count positions in a directory that has
++ * since lost entries and the client misses as many, which leaves `rm -r`
++ * unable to empty it. Each listing (a READDIR at cookie 0) therefore
++ * takes a snapshot of the directory, and the calls that continue it read
++ * the same snapshot. Snapshots are kept per directory, the least
++ * recently used given up first; a continuation whose snapshot has gone
++ * reads a fresh one from its position, as best it can.
++ */
++#define RD_CACHE	64
++
++static struct rdsnap {
++	char		*path;
++	EFS_DIR		*dir;
++	unsigned long	used;
++} rd_cache[RD_CACHE];
++static unsigned long	rd_clock;
++
++static EFS_DIR *
++readdir_snapshot(const char *path, long cookie)
++{
++	struct rdsnap	*s, *slot = NULL;
++	int		i;
++
++	for (i = 0; i < RD_CACHE; i++) {
++		s = &rd_cache[i];
++		if (s->dir != NULL && strcmp(s->path, path) == 0) {
++			slot = s;
++			if (cookie != 0) {
++				s->used = ++rd_clock;
++				return s->dir;
++			}
++			break;
++		}
++		if (slot == NULL || (slot->dir != NULL
++		 && (s->dir == NULL || s->used < slot->used)))
++			slot = s;
++	}
++	efs_closedir(slot->dir);
++	free(slot->path);
++	slot->path = NULL;
++	if ((slot->dir = efs_opendir(path)) == NULL)
++		return NULL;
++	slot->path = xstrdup(path);
++	slot->used = ++rd_clock;
++	return slot->dir;
++}
++
++/* The pseudo inode of the directory above DIR, as LOOKUP of ".." gives it. */
++static psi_t
++parent_psi(const char *dir)
++{
++	char	parent[NFS_MAXPATHLEN + 1], *slash;
++	nfs_fh	fh;
++
++	if (strlen(dir) > NFS_MAXPATHLEN)
++		return 0;
++	strcpy(parent, dir);
++	if ((slash = strrchr(parent, '/')) == NULL)
++		return 0;
++	if (slash == parent)
++		slash++;
++	*slash = '\0';
++	if (fh_create(&fh, parent) != NFS_OK)
++		return 0;
++	return fh_psi(&fh);
++}
++
+ int
+ nfsd_nfsproc_readdir_2(readdirargs *argp, struct svc_req *rqstp)
+ {
+ 	static readdirres oldres;
+ 	entry		**ep, *e;
+ 	__u32		dloc;
+-	DIR		*dirp;
++	EFS_DIR		*dirp;
+ 	struct dirent	*dp;
+ 	struct stat	sbuf;
+ 	int		res_size, dotsonly, hidedot, first;
+ 	fhcache		*h;
+ 	nfsstat		status;
+-	ino_t		dotinum = 0;
++	psi_t		dotpsi, fileid;
++	char		dirpath[NFS_MAXPATHLEN + 1];
++	long		pos;
+
+ 	/* Free the previous result, since it has 'malloc'ed strings.  */
+ 	xdr_free((xdrproc_t) xdr_readdirres, (caddr_t) &oldres);
+@@ -893,14 +965,19 @@ nfsd_nfsproc_readdir_2(readdirargs *argp, struct svc_req *rqstp)
+ 		return (NFSERR_ACCES);
+ 	if (!S_ISDIR(sbuf.st_mode))
+ 		return (NFSERR_NOTDIR);
+-	if ((dirp = efs_opendir(h->path)) == NULL)
++	memcpy(&dloc, argp->cookie, sizeof(dloc));
++	pos = ntohl(dloc);
++	if ((dirp = readdir_snapshot(h->path, pos)) == NULL)
+ 		return ((errno ? nfs_errno() : NFSERR_NAMETOOLONG));
+-
++	efs_seekdir(dirp, pos);
++
++	/* "." and ".." are given the inode numbers GETATTR and LOOKUP give
++	 * them (getwd() matches the two), not the ones the listing has: those
++	 * can differ, for "." always at the top of the export (path_psi). */
++	dotpsi = h->h.psi;
++	strncpy(dirpath, h->path, sizeof(dirpath) - 1);
++	dirpath[sizeof(dirpath) - 1] = '\0';
+ 	res_size = 0;
+-	memcpy(&dloc, argp->cookie, sizeof(dloc));
+-	if (dloc != 0)
+-		efs_seekdir(dirp, ntohl(dloc));
+-
+ 	first = 1;
+ 	ep = &(result.readdirres.readdirres_u.reply.entries);
+ 	while ((dp = efs_readdir(dirp)) != NULL) {
+@@ -908,19 +985,21 @@ nfsd_nfsproc_readdir_2(readdirargs *argp, struct svc_req *rqstp)
+ 		if (res_size >= argp->count && !first)
+ 			break;
+
+-		/* XXX: This code relies on . coming before .. */
+ 		if (!strcmp(dp->d_name, "..")) {
+-			if (hidedot)
+-				dp->d_ino = dotinum;
++			fileid = hidedot ? dotpsi : parent_psi(dirpath);
++			if (fileid == 0)
++				fileid = pseudo_inode(dp->d_ino, sbuf.st_dev);
+ 		} else if (!strcmp(dp->d_name, ".")) {
+-			dotinum = dp->d_ino;
++			fileid = dotpsi;
+ 		} else if (dotsonly) {
+ 			dp = NULL;
+ 			break;
++		} else {
++			fileid = pseudo_inode(dp->d_ino, sbuf.st_dev);
+ 		}
+
+ 		e = *ep = (entry *) xmalloc(sizeof(entry));
+-		e->fileid = pseudo_inode(dp->d_ino, sbuf.st_dev);
++		e->fileid = fileid;
+ 		e->name = xmalloc(NLENGTH(dp) + 1);
+ 		strcpy(e->name, dp->d_name);
+ 		dloc = htonl(efs_telldir(dirp));
+@@ -930,7 +1009,6 @@ nfsd_nfsproc_readdir_2(readdirargs *argp, struct svc_req *rqstp)
+ 	}
+ 	*ep = NULL;
+ 	result.readdirres.readdirres_u.reply.eof = (dp == NULL);
+-	efs_closedir(dirp);
+ 	oldres = result.readdirres;
+ 	return (result.readdirres.status);
+ }

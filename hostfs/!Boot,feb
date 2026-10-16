@@ -1,0 +1,22 @@
+| dockerix: RISC OS boot script, served from the container via Arculator's
+| HostFS. RISC OS runs it at every start (CMOS: FileSystem HostFS, Boot).
+| It is idempotent and builds the rest of the CMOS configuration itself:
+| on a clean CMOS the RMLoad only loads RISCiXFS (the Device/Unit/Partition
+| options exist only once it is loaded), the Configure lines set the SCSI
+| root and the NoRISCOS autoboot flag, and re-initialising RISCiXFS makes
+| it read them and boot the kernel. On every later start NoRISCOS is already
+| set, so RISCiXFS boots RISC iX as soon as it is loaded and nothing after
+| the RMLoad runs.
+Echo dockerix: !Boot running from HostFS
+Configure NoCaps
+Configure MonitorType 1
+| SCSIFSdiscs is read when SCSIFS initialises, so re-init it to pick the
+| change up on a first run (on a clean CMOS there are no SCSI discs yet).
+Configure SCSIFSdiscs 1
+RMReInit SCSIFS
+RMLoad SCSI::4.$.!RISCiX.RISCiXFS
+Configure Device sd0
+Configure Unit 0
+Configure Partition 0
+Configure NoRISCOS
+RMReInit RISCiXFS

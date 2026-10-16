@@ -1,0 +1,72 @@
+diff --git a/podules/common/net/net_slirp.c b/podules/common/net/net_slirp.c
+index 58da9e6..8d06817 100644
+--- a/podules/common/net/net_slirp.c
++++ b/podules/common/net/net_slirp.c
+@@ -6,6 +6,17 @@
+ #include "slirp/queue.h"
+ 
+ static queueADT *g_slirpq;
++
++/*
++ * SLiRP is not thread-safe, but it is driven from two threads here: the poll
++ * thread below (host sockets -> soread/sowrite/tcp_output) and the emulator
++ * thread (guest packets -> slirp_input -> tcp_input), both mutating the same
++ * socket list, TCP control blocks and sbufs. Without a lock, inbound data was
++ * intermittently lost mid-connection. Serialise everything except the select()
++ * wait itself. The packet queue to the guest is also shared, so its ops are
++ * covered too.
++ */
++static pthread_mutex_t slirp_lock = PTHREAD_MUTEX_INITIALIZER;
+ typedef struct net_slirp_t
+ {
+ 	pthread_t poll_thread;
+@@ -29,7 +40,9 @@ static void *slirp_poll_thread(void *p)
+ 		FD_ZERO(&rfds);
+ 		FD_ZERO(&wfds);
+ 		FD_ZERO(&xfds);
++		pthread_mutex_lock(&slirp_lock);
+ 		timeout = slirp_select_fill(&nfds, &rfds, &wfds, &xfds);
++		pthread_mutex_unlock(&slirp_lock);
+ 
+ 		if(timeout < 0)
+ 			timeout = 500;
+@@ -38,7 +51,11 @@ static void *slirp_poll_thread(void *p)
+ 
+ 		ret2 = select(nfds + 1, &rfds, &wfds, &xfds, &tv);
+ 		if (ret2 >= 0)
++		{
++			pthread_mutex_lock(&slirp_lock);
+ 			slirp_select_poll(&rfds, &wfds, &xfds);
++			pthread_mutex_unlock(&slirp_lock);
++		}
+ 	}
+ 
+ 	return NULL;
+@@ -48,10 +65,15 @@ static int net_slirp_read(net_t *net, packet_t *packet)
+ {
+ 	net_slirp_t *slirp = net->p;
+ 
++	struct queuepacket *qp = NULL;
++
++	pthread_mutex_lock(&slirp_lock);
+ 	if (QueuePeek(slirp->slirpq) > 0)
+-	{
+-		struct queuepacket *qp = QueueDelete(slirp->slirpq);
++		qp = QueueDelete(slirp->slirpq);
++	pthread_mutex_unlock(&slirp_lock);
+ 
++	if (qp)
++	{
+ 		packet->p = qp;
+ 		packet->data = qp->data;
+ 		packet->len = qp->len;
+@@ -64,7 +86,9 @@ static int net_slirp_read(net_t *net, packet_t *packet)
+ 
+ static void net_slirp_write(net_t *net, uint8_t *data, int size)
+ {
++	pthread_mutex_lock(&slirp_lock);
+ 	slirp_input(data, size);
++	pthread_mutex_unlock(&slirp_lock);
+ }
+ 
+ static void net_slirp_free(net_t *net, packet_t *packet)

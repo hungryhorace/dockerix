@@ -1,0 +1,23 @@
+diff --git a/system.h b/system.h
+index eff8abe..f2cea52 100644
+--- a/system.h
++++ b/system.h
+@@ -34,6 +34,10 @@
+ #include <stdio.h>
+ 
+ #include <rpc/rpc.h>
++/* libtirpc: xp_raddr is a sockaddr_in6-sized buffer holding the caller's
++ * address; for the IPv4 sockets used here it is a sockaddr_in. */
++#undef svc_getcaller
++#define svc_getcaller(x) ((struct sockaddr_in *)&(x)->xp_raddr)
+ #ifndef HAVE_XDRPROC_T
+ #ifdef __STDC__
+ typedef bool_t	(*xdrproc_t)(XDR *, void *, ...);
+@@ -44,6 +48,7 @@ typedef bool_t	(*xdrproc_t)();
+ 
+ #include <ctype.h>
+ #include <errno.h>
++#include <time.h>
+ #ifdef HAVE_FCNTL_H
+ # include <fcntl.h>
+ #endif

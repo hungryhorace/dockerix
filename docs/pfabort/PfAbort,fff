@@ -1,0 +1,77 @@
+10 REM >PfAbort - the last instruction before a page boundary must run
+20 REM Three MOVs are put in the last three words of the application slot.
+30 REM The page after the slot is not mapped, so fetching past the end is a
+40 REM prefetch abort. A real ARM2/ARM3 runs all three and then aborts, with
+50 REM r14 = end + 4. Arculator (up to 7d3d267) takes the abort one
+60 REM instruction early: r14 is right but the last MOV never executes.
+70 REM Needs RISC OS 3; runs in SVC mode (OS_EnterOS) to poke the vector.
+80 HIMEM = HIMEM - &8000
+90 SYS "OS_GetEnv" TO ,top%
+100 DIM res% 63, code% 255
+110 FOR pass% = 0 TO 2 STEP 2
+120 P% = code%
+130 [OPT pass%
+140 .run
+150 STMFD r13!, {r0-r12, r14}
+160 SWI "OS_EnterOS"
+170 MOV r5, #&C
+180 LDR r6, [r5]
+190 ADR r7, handler
+200 SUB r7, r7, r5
+210 SUB r7, r7, #8
+220 MOV r7, r7, LSR #2
+230 ORR r7, r7, #&EA000000
+240 STR r7, [r5]
+242 LDR r8, results
+244 STR r6, [r8, #16]
+246 STR r7, [r8, #20]
+247 LDR r9, [r5]
+248 STR r9, [r8, #24]
+250 MOV r0, #0
+260 MOV r1, #0
+270 MOV r2, #0
+280 LDR pc, target
+290 .handler
+300 LDR r8, results
+310 STR r14, [r8, #0]
+320 STR r0, [r8, #4]
+330 STR r1, [r8, #8]
+340 STR r2, [r8, #12]
+350 STR r6, [r5]
+360 TEQP pc, #0
+370 MOV r0, r0
+380 LDMFD r13!, {r0-r12, pc}
+390 .target
+400 EQUD top% - 12
+410 .results
+420 EQUD res%
+430 ]
+440 NEXT
+450 P% = top% - 12
+460 [OPT 2
+470 MOV r0, #1
+480 MOV r1, #2
+490 MOV r2, #3
+500 ]
+505 ON ERROR PROCfail
+510 CALL run
+520 PRINT "Slot ends at &";~top%;"; the page from there on is unmapped."
+530 PRINT "Handler saw r14 = &";~res%!0;", address &";~(res%!0 AND &3FFFFFC);" (expected &";~(top%+4);", aborted address + 4)"
+540 PRINT "After the abort r0,r1,r2 = ";res%!4;",";res%!8;",";res%!12;" (expected 1,2,3)"
+550 IF res%!12 = 3 THEN v$ = "OK: MOV r2,#3 at &" + STR$~(top%-4) + ", the last word before the page boundary, executed" ELSE v$ = "BUG: MOV r2,#3 at &" + STR$~(top%-4) + ", the last word before the page boundary, did not execute"
+560 PRINT v$
+570 f% = OPENOUT "HostFS:$.result"
+580 BPUT#f%, "slot end=&" + STR$~top%
+590 BPUT#f%, "r14=&" + STR$~(res%!0) + " address=&" + STR$~(res%!0 AND &3FFFFFC) + " expected=&" + STR$~(top%+4)
+600 BPUT#f%, "r0,r1,r2=" + STR$(res%!4) + "," + STR$(res%!8) + "," + STR$(res%!12) + " expected=1,2,3"
+610 BPUT#f%, v$
+620 CLOSE#f%
+630 QUIT
+640 DEF PROCfail
+650 PRINT "RISC OS's handler got the abort: ";REPORT$
+660 PRINT "vector &C was &";~res%!16;", wrote &";~res%!20;", read back &";~res%!24
+670 f% = OPENOUT "HostFS:$.result"
+680 BPUT#f%, "error: " + REPORT$
+690 BPUT#f%, "vector was &" + STR$~(res%!16) + " wrote &" + STR$~(res%!20) + " readback &" + STR$~(res%!24) + " handler at &" + STR$~code%
+700 CLOSE#f%
+710 QUIT

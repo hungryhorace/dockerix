@@ -1,0 +1,50 @@
+[package]
+name = "dockerix"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "In-container agent and host convenience CLI for the DockerIX RISC iX VM"
+license = "GPL-2.0-or-later"
+# Released as a binary, never to crates.io. Also lets deny.toml's licence
+# check skip this crate and judge the dependencies alone.
+publish = false
+
+[[bin]]
+name = "dockerix"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+# Safe system calls: the terminal, poll, signals to children, sockets.
+rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "stdio", "termios"] }
+# Signal handlers that set a flag.
+signal-hook = "0.4"
+
+# build.rs only: the hash that tags the image built from the embedded context.
+[build-dependencies]
+sha2 = "0.10"
+
+# Test directories that clean up after themselves, even when a test fails.
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+# System calls go through rustix and signal-hook; the one exception is
+# allowed where it stands (testsupport::Env).
+unsafe_code = "deny"
+# Already the 2024 edition's default; stated so the policy does not hang on
+# the edition.
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+# Shipped code says why it cannot fail (`expect`) or handles the error;
+# tests may unwrap (clippy.toml).
+unwrap_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.release]
+opt-level = 2
+# The agent is small; favour a fast, self-contained build in the image.
+lto = false
+codegen-units = 16

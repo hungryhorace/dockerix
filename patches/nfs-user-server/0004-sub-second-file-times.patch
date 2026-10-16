@@ -1,0 +1,24 @@
+diff --git a/getattr.c b/getattr.c
+index 30b1f10..37f926e 100644
+--- a/getattr.c
++++ b/getattr.c
+@@ -115,12 +115,16 @@ struct svc_req	*rqstp;
+ 	attr->fsid   = 1;
+ 	attr->fileid = fh_psi((nfs_fh *)&(fhc->h));
+ #endif
++	/* Microseconds too: a client keeps its cached data while the size and
++	 * mtime it last saw stand, so with whole seconds a file rewritten at
++	 * the same size within the second (an editor's save, a rebuild) went
++	 * on being read as it was. */
+ 	attr->atime.seconds = s->st_atime;
+-	attr->atime.useconds = 0;
++	attr->atime.useconds = s->st_atim.tv_nsec / 1000;
+ 	attr->mtime.seconds = s->st_mtime;
+-	attr->mtime.useconds = 0;
++	attr->mtime.useconds = s->st_mtim.tv_nsec / 1000;
+ 	attr->ctime.seconds = s->st_ctime;
+-	attr->ctime.useconds = 0;
++	attr->ctime.useconds = s->st_ctim.tv_nsec / 1000;
+
+ #ifdef DEBUG
+ 	sp = buff;

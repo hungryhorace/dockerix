@@ -1,0 +1,18 @@
+diff --git a/podules/common/net/slirp/ip_input.c b/podules/common/net/slirp/ip_input.c
+index ae028a0..a500072 100644
+--- a/podules/common/net/slirp/ip_input.c
++++ b/podules/common/net/slirp/ip_input.c
+@@ -363,7 +363,12 @@ insert:
+ 	 */
+ 	if (m->m_flags & M_EXT) {
+ 	  int delta;
+-	  delta = (char *)ip - m->m_dat;
++	  /* Relative to the first fragment (q), not the one that just arrived
++	   * (ip): the latter lives in another mbuf, and the delta from it was
++	   * garbage whenever the last fragment to arrive was not the first
++	   * (a segfault on any guest datagram spanning more than one mbuf, e.g.
++	   * an 8K NFS write). Same fix as QEMU/libslirp. */
++	  delta = (char *)q - m->m_dat;
+ 	  q = (struct ipasfrag *)(m->m_ext + delta);
+ 	}
+ 

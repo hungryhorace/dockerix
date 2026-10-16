@@ -1,0 +1,3 @@
+# `clippy::unwrap_used` (Cargo.toml `[lints]`) is for the shipped code: a
+# test that unwraps is asserting, and a panic there is the failure report.
+allow-unwrap-in-tests = true

@@ -1,0 +1,104 @@
+# The Rust checks on pushes and pull requests, so they get a tick without
+# the maintainer's Jenkins. The Jenkinsfile stays the CI of record: it runs
+# these same stages on its own agents and then builds the image and runs
+# the smoke test against the real guest, which needs the ROMs and disc
+# image that GitHub never has. So no image build here (the runner could,
+# but it takes minutes and Jenkins already proves it), and no smoke test.
+#
+# The stages mirror the Jenkinsfile's matrix: Toolchain, Build, Test, Fmt,
+# Clippy, Doc on both platforms, then Deny and Lint on Linux only. Keep the
+# two lists in step, and the pins too: the Rust minor is the Dockerfile's
+# `rust:1.96-slim` (they move together), cargo-deny 0.20.2 and the hadolint
+# and shellcheck images are the Jenkinsfile's.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  ci:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v5
+
+      # The branch name is the toolchain: 1.96.x, with the components the
+      # Fmt and Clippy stages need.
+      - uses: dtolnay/rust-toolchain@1.96
+        with:
+          components: clippy, rustfmt
+
+      - name: Toolchain
+        run: rustc --version && cargo --version && cargo clippy --version && cargo fmt --version
+
+      - name: Build
+        run: cargo build --locked --all-targets
+
+      - name: Test
+        run: cargo test --locked
+
+      # Formatting is settled by cli/rustfmt.toml; any diff from it fails.
+      - name: Fmt
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # The doc comments, private items included (the default for a
+      # binary): broken links and bad markup fail.
+      - name: Doc
+        run: cargo doc --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # Dependencies against cli/deny.toml: advisories, licences, duplicate
+      # versions, sources. The graph is the same on both platforms, so it is
+      # checked once. The release binary, so it is the exact version the
+      # Jenkinsfile installs, verified by hash.
+      - name: Deny
+        if: runner.os == 'Linux'
+        run: |
+          set -eu
+          tarball=cargo-deny-0.20.2-x86_64-unknown-linux-musl
+          curl -sSL -o /tmp/deny.tgz \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/$tarball.tar.gz"
+          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  /tmp/deny.tgz" \
+            | sha256sum -c -
+          tar -xzf /tmp/deny.tgz -C /tmp
+          "/tmp/$tarball/cargo-deny" --version
+          "/tmp/$tarball/cargo-deny" --locked check
+
+      # hadolint on the Dockerfile (.hadolint.yaml) and shellcheck on
+      # scripts/, from the same pinned images as the Jenkinsfile, run the
+      # same way (the files in on stdin).
+      - name: Lint
+        if: runner.os == 'Linux'
+        working-directory: .
+        run: |
+          set -eu
+          tar -c Dockerfile .hadolint.yaml \
+            | docker run --rm -i --entrypoint sh hadolint/hadolint:v2.15.1-debian \
+                -c 'cd "$(mktemp -d)" && tar -x && hadolint Dockerfile'
+          tar -c scripts \
+            | docker run --rm -i --entrypoint sh koalaman/shellcheck-alpine:v0.11.0 \
+                -c 'cd "$(mktemp -d)" && tar -x && shellcheck scripts/*.sh'

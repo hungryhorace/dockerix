@@ -1,0 +1,11 @@
+/cli/target
+
+# Release tarballs (scripts/package.sh)
+/dist/
+
+# Work area contents (keep the dir + its README)
+/workarea/*
+!/workarea/README.md
+!/workarea/hello/
+/workarea/hello/*
+!/workarea/hello/hello.c

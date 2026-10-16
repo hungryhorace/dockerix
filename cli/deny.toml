@@ -1,0 +1,39 @@
+# cargo-deny, run by the Jenkins `Deny` stage: known vulnerabilities and
+# unmaintained or yanked crates, licences, duplicate versions, and where
+# crates come from.
+
+[graph]
+# The CLI is built for macOS and Linux only; Windows-only crates (in the
+# lock file through clap and tempfile) are out of the graph.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+]
+
+[advisories]
+# Unmaintained crates fail too, anywhere in the graph, not just
+# vulnerable ones.
+unmaintained = "all"
+yanked = "deny"
+
+[licenses]
+# What the dependencies use today, all compatible with the crate's GPL.
+# A new licence is a decision: add it here deliberately.
+allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
+# The crate itself is GPL-2.0-or-later and `publish = false`; the allow list
+# is for what it pulls in, not for it.
+private = { ignore = true }
+confidence-threshold = 0.93
+unused-allowed-license = "deny"
+
+[bans]
+# One version of each crate: a second is a build-time and audit cost
+# worth noticing.
+multiple-versions = "deny"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

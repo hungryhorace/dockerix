@@ -1,0 +1,112 @@
+// The release pipeline: from a `v*` tag, build the `dockerix` tarball on
+// each platform and attach both, with their checksums, to a GitHub Release
+// of that tag.
+//
+// A second multibranch job points at this file: tags only, name filter
+// `v.*`, and the `dockerix-release-token` credential (a fine-grained token
+// with contents read/write on the repository) bound as a string credential.
+// The branch job (Jenkinsfile) discovers branches only, so the two never
+// see the same ref. Each agent needs the Rust toolchain and `gh` on PATH.
+// The tag must be `v` + the version in cli/Cargo.toml.
+//
+// Both matrix cells publish to one Release: whichever creates it first
+// wins, the other's create is a no-op, and each uploads its own files with
+// --clobber. Nothing here deletes a release or an asset, so a re-run (the
+// RELEASE_TAG parameter) refreshes the assets in place.
+pipeline {
+    agent none
+
+    options {
+        timestamps()
+        timeout(time: 40, unit: 'MINUTES')
+    }
+
+    parameters {
+        string(name: 'RELEASE_TAG', defaultValue: '',
+               description: 'Re-run for a tag by hand, e.g. v0.1.0 (normally the tag that triggered the build)')
+    }
+
+    environment {
+        REL_TAG = "${env.TAG_NAME ?: params.RELEASE_TAG}"
+        GH_REPO = 'hungryhorace/dockerix'
+        CARGO_TERM_COLOR = 'always'
+        CARGO_INCREMENTAL = '0'
+    }
+
+    stages {
+        stage('Release') {
+            matrix {
+                axes {
+                    axis {
+                        name 'PLATFORM'
+                        values 'mac', 'amd64'
+                    }
+                }
+                agent { label "${PLATFORM}" }
+                stages {
+                    // The tag must be `v` + the Cargo version, or the binary
+                    // would report one version and the release another.
+                    // Fails before anything is built.
+                    stage('Guard') {
+                        steps {
+                            sh '''
+                                ver=$(sed -n 's/^version = "\\(.*\\)"/\\1/p' cli/Cargo.toml | head -1)
+                                if [ -z "$REL_TAG" ]; then
+                                    echo "No tag: run from a v* tag, or set RELEASE_TAG" >&2
+                                    exit 1
+                                fi
+                                if [ "$REL_TAG" != "v$ver" ]; then
+                                    echo "Tag $REL_TAG does not match cli/Cargo.toml version $ver (expected v$ver)" >&2
+                                    exit 1
+                                fi
+                                echo "Releasing $REL_TAG on $(rustc -vV | sed -n 's/^host: //p')"
+                            '''
+                        }
+                    }
+                    // A release is built from a tested tree, even though the
+                    // branch job tested the same commit before it was
+                    // published; it costs a minute.
+                    stage('Test') {
+                        steps {
+                            dir('cli') {
+                                sh 'cargo test --locked'
+                            }
+                        }
+                    }
+                    stage('Package') {
+                        steps {
+                            sh 'scripts/package.sh "$(rustc -vV | sed -n \'s/^host: //p\')"'
+                        }
+                    }
+                    stage('Publish') {
+                        steps {
+                            withCredentials([string(credentialsId: 'dockerix-release-token', variable: 'GH_TOKEN')]) {
+                                sh '''
+                                    gh release create "$REL_TAG" --title "$REL_TAG" --generate-notes || true
+                                    gh release upload "$REL_TAG" dist/*.tar.gz dist/*.sha256 --clobber
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // One SHA256SUMS over both tarballs, assembled from the per-file
+        // checksums the cells uploaded. A convenience; the .sha256 files
+        // already suffice.
+        stage('Checksums') {
+            agent { label 'amd64' }
+            steps {
+                withCredentials([string(credentialsId: 'dockerix-release-token', variable: 'GH_TOKEN')]) {
+                    sh '''
+                        rm -rf sums && mkdir sums
+                        gh release download "$REL_TAG" --pattern '*.sha256' --dir sums
+                        cat sums/*.sha256 > sums/SHA256SUMS
+                        cat sums/SHA256SUMS
+                        gh release upload "$REL_TAG" sums/SHA256SUMS --clobber
+                    '''
+                }
+            }
+        }
+    }
+}

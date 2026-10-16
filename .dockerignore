@@ -1,0 +1,5 @@
+# The build context is the repo root; keep the heavy, image-irrelevant bits
+# out of it (cli/target alone is gigabytes), so a build uploads cli/ sources,
+# patches/, configs/ and the like — not compiled artifacts or git history.
+cli/target
+.git

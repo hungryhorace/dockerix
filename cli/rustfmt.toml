@@ -1,0 +1,6 @@
+# Chosen in quality.md M1 as the settings closest to the code's existing hand
+# style (the smallest `cargo fmt` diff of the widths tried): lines up to 110
+# columns, and short calls, literals and chains kept on one line up to that
+# width rather than rustfmt's default fractions of it.
+max_width = 110
+use_small_heuristics = "Max"

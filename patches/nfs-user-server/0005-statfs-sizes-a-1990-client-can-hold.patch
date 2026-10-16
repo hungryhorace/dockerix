@@ -1,0 +1,46 @@
+--- a/nfsd.c
++++ b/nfsd.c
+@@ -1012,7 +1012,23 @@
+ 	oldres = result.readdirres;
+ 	return (result.readdirres.status);
+ }
++
++/* get_fs_usage() counts 512-byte blocks; STATFS answers in STATFS_BSIZE
++ * ones, no more of them than 2 GB holds, and no more than the total. */
++#define STATFS_BSIZE	1024
++#define STATFS_MAX	(0x7fffffffUL / STATFS_BSIZE)
+
++static unsigned long
++statfs_clamp(long n512, long total512)
++{
++	unsigned long n = (n512 < 0) ? 0 : (unsigned long) n512 / (STATFS_BSIZE / 512);
++	unsigned long t = (total512 < 0) ? 0 : (unsigned long) total512 / (STATFS_BSIZE / 512);
++
++	if (t > STATFS_MAX)
++		t = STATFS_MAX;
++	return (n > t) ? t : n;
++}
++
+ /*
+  * Only reports free space correctly for the filesystem that the
+  * mount point is on.  Actually it will work fine for any file
+@@ -1034,12 +1050,15 @@
+
+ 	if (get_fs_usage(path, NULL, &fs) < 0)
+ 		return (nfs_errno());
++	/* In 1K blocks, and at most 2 GB of them: a 1990 client multiplies
++	 * blocks by the block size in 32 bits, so a bigger disc (a Mac's,
++	 * through the bind mount) showed in df as negative and full. */
+ 	result.statfsres.status = NFS_OK;
+ 	result.statfsres.statfsres_u.reply.tsize = 8*1024;
+-	result.statfsres.statfsres_u.reply.bsize = 512;
+-	result.statfsres.statfsres_u.reply.blocks = fs.fsu_blocks;
+-	result.statfsres.statfsres_u.reply.bfree = fs.fsu_bfree;
+-	result.statfsres.statfsres_u.reply.bavail = fs.fsu_bavail;
++	result.statfsres.statfsres_u.reply.bsize = STATFS_BSIZE;
++	result.statfsres.statfsres_u.reply.blocks = statfs_clamp(fs.fsu_blocks, fs.fsu_blocks);
++	result.statfsres.statfsres_u.reply.bfree = statfs_clamp(fs.fsu_bfree, fs.fsu_blocks);
++	result.statfsres.statfsres_u.reply.bavail = statfs_clamp(fs.fsu_bavail, fs.fsu_blocks);
+
+ 	return (NFS_OK);
+ }

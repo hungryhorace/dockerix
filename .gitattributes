@@ -1,0 +1,4 @@
+# Patches carry the line endings of the files they touch (several upstream
+# Arculator files are CRLF); store them byte for byte, or core.autocrlf
+# strips the CRs on commit and the patch no longer applies on a fresh clone.
+patches/**/*.patch -text

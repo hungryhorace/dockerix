@@ -1,0 +1,5 @@
+| Arculator prefetch-abort demo: run PfAbort and write HostFS:$.result
+Echo pfdemo: running PfAbort
+Dir HostFS:$
+BASIC -chain PfAbort
+Echo pfdemo: done

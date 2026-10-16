@@ -1,0 +1,50 @@
+diff --git a/podules/common/net/ne2000.c b/podules/common/net/ne2000.c
+index a08c175..fd972f9 100644
+--- a/podules/common/net/ne2000.c
++++ b/podules/common/net/ne2000.c
+@@ -350,6 +350,23 @@ static inline void ne2000_chipmem_write_w(uint32_t address, uint16_t value, ne20
+ 		*(uint16_t *)(ne2000->mem + (address - BX_NE2K_MEMSTART)) = cpu_to_le16(value);
+ }
+
++//
++// Step the remote DMA address, wrapping from the end of the receive ring
++// to its start as the 8390 does. PSTOP may be 0x100 (a ring reaching the
++// top of the 64K), so the end of the ring is 0x10000: do the arithmetic
++// wider than the 16-bit address register, or the address rolls over to 0
++// instead of wrapping to PSTART, and a frame that crosses the end of the
++// ring is read back with its tail taken from the bottom of memory.
++//
++static void ne2000_dma_advance(ne2000_t *ne2000, int io_len)
++{
++	uint32_t next = (uint32_t)ne2000->remote_dma + io_len;
++
++	if (next == (uint32_t)ne2000->page_stop << 8)
++		next = (uint32_t)ne2000->page_start << 8;
++	ne2000->remote_dma = (uint16_t)next;
++}
++
+ //
+ // asic_read/asic_write - This is the high 16 bytes of i/o space
+ // (the lower 16 bytes is for the DS8390). Only two locations
+@@ -369,9 +386,7 @@ static uint16_t ne2000_dma_read(int io_len, void *p)
+ 	// by the selected word size after every access, not by
+ 	// the amount of data requested by the host (io_len).
+ 	//
+-	ne2000->remote_dma += io_len;
+-	if (ne2000->remote_dma == ne2000->page_stop << 8)
+-		ne2000->remote_dma = ne2000->page_start << 8;
++	ne2000_dma_advance(ne2000, io_len);
+
+ 	// keep s.remote_bytes from underflowing
+ 	if (ne2000->remote_bytes > 1)
+@@ -421,9 +436,7 @@ static void ne2000_dma_write(int io_len, void *p)
+ 	ne2000_t *ne2000 = (ne2000_t *)p;
+
+ 	// is this right ??? asic_read uses DCR.wordsize
+-	ne2000->remote_dma   += io_len;
+-	if (ne2000->remote_dma == ne2000->page_stop << 8)
+-		ne2000->remote_dma = ne2000->page_start << 8;
++	ne2000_dma_advance(ne2000, io_len);
+
+ 	ne2000->remote_bytes -= io_len;
+ 	if (ne2000->remote_bytes > BX_NE2K_MEMSIZ)

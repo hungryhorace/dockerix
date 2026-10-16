@@ -1,0 +1,27 @@
+diff --git a/podules/common/sound/sound_out_sdl2.c b/podules/common/sound/sound_out_sdl2.c
+index 89abcbe..330b561 100644
+--- a/podules/common/sound/sound_out_sdl2.c
++++ b/podules/common/sound/sound_out_sdl2.c
+@@ -17,6 +17,9 @@ void sound_out_close(void *p)
+ {
+ 	sdl_sound_t *sdl_sound = (sdl_sound_t *)p;
+ 
++	if (!sdl_sound)
++		return;
++
+ 	SDL_CloseAudioDevice(sdl_sound->audio_device);
+ 
+ 	free(sdl_sound);
+@@ -56,6 +59,12 @@ void sound_out_buffer(void *p, int16_t *buf, int len)
+ {
+ 	sdl_sound_t *sdl_sound = (sdl_sound_t *)p;
+ 
++	/* sound_out_init returns NULL when the audio device could not be opened
++	   (no sound hardware, or an SDL backend that allows a single device);
++	   callers pass that straight back here, so treat it as "no output". */
++	if (!sdl_sound)
++		return;
++
+ 	/*If we're already sufficiently ahead of the audio device then drop this buffer rather than
+ 	  allowing the queued audio to build up indefinitely*/
+ 	if (SDL_GetQueuedAudioSize(sdl_sound->audio_device) > (sdl_sound->buffer_size * 4 * 4))

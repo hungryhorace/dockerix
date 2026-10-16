@@ -1,0 +1,7 @@
+# hadolint, run by the Jenkins `Lint` stage on the Dockerfile. Anything it
+# reports fails the build, except:
+ignored:
+  # DL3008, pin apt package versions: Ubuntu's archive drops a version once
+  # it is superseded, so `pkg=1.2-3ubuntu4` stops installing at the next
+  # security update. The `ubuntu:26.04` base fixes the release instead.
+  - DL3008

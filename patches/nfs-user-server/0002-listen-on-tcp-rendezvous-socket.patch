@@ -1,0 +1,24 @@
+diff --git a/rpcmisc.c b/rpcmisc.c
+--- a/rpcmisc.c
++++ b/rpcmisc.c
+@@ -228,7 +228,20 @@
+ 		close(s);
+ 		s = RPC_ANYSOCK;
+ 	}
+-
++	else if (sock_type == SOCK_STREAM) {
++		/* libtirpc's svctcp_create() only listen()s on a socket it
++		 * creates itself (RPC_ANYSOCK), not on one handed to it already
++		 * bound as here. Without the listen() the TCP rendezvous fd is
++		 * never in the accepting state: poll() reports POLLHUP, accept()
++		 * returns EINVAL, the event never clears and svc_run() spins at
++		 * 100% CPU. Put it in the listening state ourselves. */
++		if (listen(s, SOMAXCONN) == -1) {
++			Dprintf(L_ERROR, "Could not listen on %s socket: %s\n",
++					prot_name, strerror(errno));
++			close(s);
++			s = RPC_ANYSOCK;
++		}
++	}
+ 	return (s);
+ }

@@ -1,0 +1,62 @@
+diff --git a/src/arm.c b/src/arm.c
+index f0d0bf3..e323e98 100644
+--- a/src/arm.c
++++ b/src/arm.c
+@@ -2655,25 +2655,26 @@ void execarm(int cycles_to_execute)
+ 		cache_read_timing(PC, ((PC & 0xc) && !promote_fetch_to_n) ? 0 : 1, promote_fetch_to_n);
+ 		promote_fetch_to_n = PROMOTE_NONE;
+ 
+-		if (!prefabort)
+-		{
+-			if (debugon)
+-				debugger_do();
+-
+-			if (flaglookup[opcode >> 28][armregs[15] >> 28])
+-				opcode_fns[(opcode >> 20) & 0xff](opcode);
+-		}
+-
++		/*prefabort marks the instruction behind this one in the pipeline
++		  (the one refillpipeline() or the fetch above could not read), so
++		  this one always executes; its abort, taken below, has not reached
++		  the execute stage yet. Skipping it here lost the last instruction
++		  before every page boundary whose next page was not yet resident,
++		  which a demand-paging OS (RISC iX) hits all the time.*/
++		if (debugon)
++			debugger_do();
++
++		if (flaglookup[opcode >> 28][armregs[15] >> 28])
++			opcode_fns[(opcode >> 20) & 0xff](opcode);
++
++		/*In the ARM's priority order: data abort, FIQ, IRQ, prefetch abort.
++		  A prefetch abort is of the instruction behind this one, so the
++		  abort or interrupt of this one comes first, and the refill they
++		  cause drops the prefetch abort, to recur when that instruction is
++		  fetched again.*/
+ 		if (databort|armirq|prefabort)
+ 		{
+-			if (prefabort)       /*Prefetch abort*/
+-			{
+-				if (debugon)
+-					debug_trap(DEBUG_TRAP_PREF_ABORT, opcode);
+-				prefabort = 0;
+-				EXCEPTION_PREF_ABORT();
+-			}
+-			else if (databort == 1)     /*Data abort*/
++			if (databort == 1)     /*Data abort*/
+ 			{
+ 				if (debugon)
+ 					debug_trap(DEBUG_TRAP_DATA_ABORT, opcode);
+@@ -2697,6 +2698,13 @@ void execarm(int cycles_to_execute)
+ //                                rpclog("IRQ %02X %02X\n",ioc.irqa&ioc.mska,ioc.irqb&ioc.mskb);
+ 				EXCEPTION_IRQ();
+ 			}
++			else if (prefabort)       /*Prefetch abort*/
++			{
++				if (debugon)
++					debug_trap(DEBUG_TRAP_PREF_ABORT, opcode);
++				prefabort = 0;
++				EXCEPTION_PREF_ABORT();
++			}
+ 		}
+ 		prefabort = prefabort_next;
+ 		armirq = irq;
