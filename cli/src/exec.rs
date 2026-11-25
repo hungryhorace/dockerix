@@ -2,7 +2,7 @@
 
 use std::io::{self, IsTerminal, Write};
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::config::{self, Config};
@@ -264,9 +264,12 @@ fn or_logout<T>(session: &mut Session, prepare: impl FnOnce(&mut Session) -> io:
 /// `out.warn` receives messages for the user's stderr and `out.progress`
 /// the push's transfer events (progress.rs). `sync_lock`, when given,
 /// is held during the push so concurrent sessions never push (and touch the
-/// manifest) at once; the command itself runs unlocked. `interrupt` is polled
-/// during the command only (never mid-sync): see `Session::run_to`. The
-/// session is left logged in; on error the caller must treat it as unusable.
+/// manifest) at once; the command itself runs unlocked. `interrupt` is
+/// polled during the command (see `Session::run_to`), and before the push
+/// and the command: raised by then, neither starts and the status is 130.
+/// Never mid-push, which must finish to leave the guest shell and the
+/// manifest whole. The session is left logged in; on error the caller must
+/// treat it as unusable.
 pub fn run_command(
     cfg: &Config,
     session: &mut Session,
@@ -276,6 +279,10 @@ pub fn run_command(
     interrupt: Option<&AtomicBool>,
     out: &mut Output<'_>,
 ) -> io::Result<i32> {
+    let interrupted = || interrupt.is_some_and(|f| f.load(Ordering::SeqCst));
+    if interrupted() {
+        return Ok(130);
+    }
     if !req.sync {
         // Same working directory as the synced path, so `./hello` means the
         // same thing whether or not the push ran.
@@ -285,6 +292,9 @@ pub fn run_command(
     {
         let _g = sync_lock.map(|m| m.lock().unwrap_or_else(|p| p.into_inner()));
         push_workarea(session, cfg, &req.push_opts(), deadline, out)?;
+    }
+    if interrupted() {
+        return Ok(130);
     }
     // Run in the shared dir so relative paths match the host's view. The
     // subdirectory exists after the push (the delta carries new directories,
@@ -528,6 +538,40 @@ __rixmnt() {
         let st = guest.state();
         let pushed: Vec<_> = st.commands[before..].iter().filter(|c| c.ends_with("uudecode")).collect();
         assert_eq!(pushed.len(), 1, "{:?}", &st.commands[before..]);
+    }
+
+    /// `run_command` with an interrupt flag, raised before it starts or by
+    /// the push's first warning (the full push's notice), mid-push.
+    fn run_interrupted(cfg: &Config, session: &mut Session, mid_push: bool) -> i32 {
+        let flag = AtomicBool::new(!mid_push);
+        let mut warn = |_: &str| flag.store(true, Ordering::SeqCst);
+        let mut output =
+            Output { sink: &mut |_| {}, warn: &mut warn, progress: &mut |_| {}, started: &mut || {} };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        run_command(cfg, session, &request("cc hello.c", true), deadline, None, Some(&flag), &mut output)
+            .unwrap()
+    }
+
+    #[test]
+    fn an_interrupt_before_the_push_stops_both() {
+        let guest = compiler();
+        let (_tmp, _wa, cfg) = push_cfg(&guest, "exec-int-before");
+        let mut s = guest.login();
+        assert_eq!(run_interrupted(&cfg, &mut s, false), 130);
+        assert!(guest_file(&guest, "/workarea/hello.c").is_none(), "pushed");
+        assert!(!guest.state().commands.iter().any(|c| c == "cc hello.c"));
+    }
+
+    #[test]
+    fn an_interrupt_mid_push_lets_it_finish_but_stops_the_command() {
+        let guest = compiler();
+        let (_tmp, _wa, cfg) = push_cfg(&guest, "exec-int-push");
+        let mut s = guest.login();
+        assert_eq!(run_interrupted(&cfg, &mut s, true), 130);
+        assert!(guest_file(&guest, "/workarea/hello.c").is_some(), "the push finished");
+        assert!(!guest.state().commands.iter().any(|c| c == "cc hello.c"));
+        // The session is fit for the next command.
+        assert_eq!(run(&cfg, &mut s, &request("cc hello.c", true)).0, 0);
     }
 
     /// With the staging export there, the push goes by NFS: the guest

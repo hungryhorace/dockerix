@@ -183,10 +183,22 @@ own execution time plus a few milliseconds.
   `docker exec … rix` kills the Docker client and the guest command runs
   on. `dockerix` tags each run with an id, catches SIGINT and sends the
   agent an abort for that id; the agent sends the guest tty its interrupt
-  character, as the console would, and returns 130. An interrupt during
-  the push takes effect once the push has finished (cutting a push short
-  would leave the guest shell reading the rest of the archive as
-  commands), so a large work area can make Ctrl-C look slow.
+  character, as the console would, and returns 130. A command still
+  waiting for a session stops waiting at once and never runs. An interrupt
+  during the push takes effect once the push has finished (cutting a push
+  short would leave the guest shell reading the rest of the archive as
+  commands), and the command is then not run, so a large work area can
+  make Ctrl-C look slow.
+- **`dockerix kill PID`** stops an entry of `dockerix ps` from any
+  terminal. `ps` names each by the pid of the `rix` in the container that
+  asked for it, which the agent reads off its socket. A command on a held
+  session is interrupted as by Ctrl-C (waiting or mid-push included, as
+  above), and its client says it was stopped by `dockerix kill` and exits
+  130. An `exec -t`, a login or a
+  `DOCKERIX_DIRECT=1` command is a `rix` of its own: the agent hangs it up
+  (SIGHUP), its telnet connection closes and the guest hangs up the shell
+  and what it runs; its client exits 129. Only pids `ps` lists are
+  signalled.
 - A command is abandoned after an hour; `dockerix exec --timeout SECS` (or
   `run --timeout`) sets another limit, and `--timeout 0` none.
 

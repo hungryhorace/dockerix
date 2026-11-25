@@ -95,8 +95,10 @@ impl Pool {
     /// Flag the run `id` for interruption, or remember the request if it
     /// has not started yet. Returns whether a run was found.
     pub(super) fn abort(&self, id: &str) -> bool {
-        if let Some(flag) = self.runs.lock().unwrap_or_else(|p| p.into_inner()).get(id) {
+        let flag = self.runs.lock().unwrap_or_else(|p| p.into_inner()).get(id).cloned();
+        if let Some(flag) = flag {
             flag.store(true, Ordering::SeqCst);
+            self.wake_waiters();
             return true;
         }
         self.early_aborts.lock().unwrap_or_else(|p| p.into_inner()).insert(id.to_string(), Instant::now());
@@ -111,11 +113,28 @@ impl Pool {
     /// client has claimed, else a new login while under the limit, else the
     /// longest-idle session of another client (its shell state comes along;
     /// see the module comment), else wait for one to be returned. Sessions
-    /// found dead are discarded on the way.
-    pub(super) fn checkout(&self, key: Option<&str>, deadline: Instant) -> io::Result<Session> {
+    /// found dead are discarded on the way. Once `interrupt` is raised
+    /// (Ctrl-C, `dockerix kill`, the client gone) it stops waiting, with
+    /// `ErrorKind::Interrupted`; whoever raises it calls `wake_waiters`.
+    pub(super) fn checkout(
+        &self,
+        key: Option<&str>,
+        deadline: Instant,
+        interrupt: Option<&AtomicBool>,
+    ) -> io::Result<Session> {
         loop {
             let mut st = self.lock();
             loop {
+                if interrupt.is_some_and(|f| f.load(Ordering::SeqCst)) {
+                    // A checkin or discard may have woken this waiter rather
+                    // than another: pass the wakeup on, or a session could
+                    // sit idle while someone waits.
+                    self.cv.notify_one();
+                    return Err(io::Error::new(
+                        ErrorKind::Interrupted,
+                        "interrupted while waiting for a guest session",
+                    ));
+                }
                 let pos = key
                     .and_then(|k| st.idle.iter().position(|h| h.key.as_deref() == Some(k)))
                     .or_else(|| st.idle.iter().position(|h| h.key.is_none()))
@@ -185,6 +204,14 @@ impl Pool {
         }
     }
 
+    /// Wake every waiting checkout, to look at its interrupt flag: called
+    /// after raising one. Taking the lock first means a waiter is either
+    /// still to look (and sees the flag) or already waiting (and wakes).
+    pub(super) fn wake_waiters(&self) {
+        let _st = self.lock();
+        self.cv.notify_all();
+    }
+
     pub(super) fn checkin(&self, session: Session, key: Option<String>) {
         let mut st = self.lock();
         st.idle.push_back(Held { session, key, idle_since: Instant::now() });
@@ -249,14 +276,14 @@ mod tests {
     fn a_key_gets_back_its_own_session() {
         let guest = FakeGuest::start();
         let pool = pool(&guest, 2, Duration::from_secs(600));
-        let mut a = pool.checkout(Some("a"), soon()).unwrap();
+        let mut a = pool.checkout(Some("a"), soon(), None).unwrap();
         let pa = port(&mut a);
         pool.checkin(a, Some("a".into()));
         // A new client logs in afresh while the pool has room.
-        let mut b = pool.checkout(Some("b"), soon()).unwrap();
+        let mut b = pool.checkout(Some("b"), soon(), None).unwrap();
         assert_ne!(port(&mut b), pa);
         pool.checkin(b, Some("b".into()));
-        let mut a = pool.checkout(Some("a"), soon()).unwrap();
+        let mut a = pool.checkout(Some("a"), soon(), None).unwrap();
         assert_eq!(port(&mut a), pa);
         assert_eq!(guest.state().logins, 2);
     }
@@ -265,10 +292,10 @@ mod tests {
     fn an_unclaimed_session_is_used_before_a_new_login() {
         let guest = FakeGuest::start();
         let pool = pool(&guest, 2, Duration::from_secs(600));
-        let mut s = pool.checkout(None, soon()).unwrap();
+        let mut s = pool.checkout(None, soon(), None).unwrap();
         let p = port(&mut s);
         pool.checkin(s, None);
-        let mut s = pool.checkout(Some("x"), soon()).unwrap();
+        let mut s = pool.checkout(Some("x"), soon(), None).unwrap();
         assert_eq!(port(&mut s), p);
         assert_eq!(guest.state().logins, 1);
     }
@@ -277,12 +304,12 @@ mod tests {
     fn at_the_limit_the_longest_idle_session_is_borrowed() {
         let guest = FakeGuest::start();
         let pool = pool(&guest, 2, Duration::from_secs(600));
-        let mut a = pool.checkout(Some("a"), soon()).unwrap();
-        let b = pool.checkout(Some("b"), soon()).unwrap();
+        let mut a = pool.checkout(Some("a"), soon(), None).unwrap();
+        let b = pool.checkout(Some("b"), soon(), None).unwrap();
         let pa = port(&mut a);
         pool.checkin(a, Some("a".into()));
         pool.checkin(b, Some("b".into()));
-        let mut c = pool.checkout(Some("c"), soon()).unwrap();
+        let mut c = pool.checkout(Some("c"), soon(), None).unwrap();
         assert_eq!(port(&mut c), pa);
         assert_eq!(guest.state().logins, 2);
     }
@@ -291,30 +318,79 @@ mod tests {
     fn at_the_limit_with_none_idle_checkout_waits() {
         let guest = FakeGuest::start();
         let pool = pool(&guest, 1, Duration::from_secs(600));
-        let held = pool.checkout(None, soon()).unwrap();
-        let e = pool.checkout(None, Instant::now() + Duration::from_millis(30)).err().unwrap();
+        let held = pool.checkout(None, soon(), None).unwrap();
+        let e = pool.checkout(None, Instant::now() + Duration::from_millis(30), None).err().unwrap();
         assert_eq!(e.kind(), ErrorKind::TimedOut);
         let returner = Arc::clone(&pool);
         let t = thread::spawn(move || {
             thread::sleep(Duration::from_millis(20));
             returner.checkin(held, None);
         });
-        assert!(pool.checkout(None, soon()).is_ok());
+        assert!(pool.checkout(None, soon(), None).is_ok());
         t.join().unwrap();
         assert_eq!(guest.state().logins, 1);
+    }
+
+    #[test]
+    fn an_interrupt_stops_a_waiting_checkout() {
+        let guest = FakeGuest::start();
+        let pool = pool(&guest, 1, Duration::from_secs(600));
+        let _held = pool.checkout(None, soon(), None).unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let (p, f) = (Arc::clone(&pool), Arc::clone(&flag));
+        let waiter =
+            thread::spawn(move || p.checkout(None, Instant::now() + Duration::from_secs(60), Some(&f)));
+        thread::sleep(Duration::from_millis(20));
+        let raised = Instant::now();
+        flag.store(true, Ordering::SeqCst);
+        pool.wake_waiters();
+        let e = waiter.join().unwrap().err().unwrap();
+        assert_eq!(e.kind(), ErrorKind::Interrupted);
+        assert!(raised.elapsed() < Duration::from_secs(5), "waited {:?}", raised.elapsed());
+        // Raised before it ever waits, it does not wait at all.
+        let e = pool.checkout(None, Instant::now() + Duration::from_secs(60), Some(&flag)).err().unwrap();
+        assert_eq!(e.kind(), ErrorKind::Interrupted);
+        assert_eq!(guest.state().logins, 1);
+    }
+
+    /// The checkin's one wakeup may reach the interrupted waiter rather than
+    /// the other: it must pass it on, not leave the session idle while the
+    /// other waits out its deadline.
+    #[test]
+    fn an_interrupted_waiter_passes_the_wakeup_on() {
+        let guest = FakeGuest::start();
+        let pool = pool(&guest, 1, Duration::from_secs(600));
+        let held = pool.checkout(None, soon(), None).unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let long = Instant::now() + Duration::from_secs(10);
+        let (p, f) = (Arc::clone(&pool), Arc::clone(&flag));
+        let quitter = thread::spawn(move || p.checkout(None, long, Some(&f)));
+        // Waiting first, it is the likelier to get the wakeup.
+        thread::sleep(Duration::from_millis(20));
+        let p = Arc::clone(&pool);
+        let other = thread::spawn(move || p.checkout(None, long, None));
+        thread::sleep(Duration::from_millis(20));
+        // Raised without a wake_waiters: only the checkin wakes anyone.
+        flag.store(true, Ordering::SeqCst);
+        let returned = Instant::now();
+        pool.checkin(held, None);
+        assert!(other.join().unwrap().is_ok());
+        assert!(returned.elapsed() < Duration::from_secs(5), "waited {:?}", returned.elapsed());
+        pool.wake_waiters();
+        assert_eq!(quitter.join().unwrap().err().unwrap().kind(), ErrorKind::Interrupted);
     }
 
     #[test]
     fn a_discard_lets_a_waiting_checkout_log_in() {
         let guest = FakeGuest::start();
         let pool = pool(&guest, 1, Duration::from_secs(600));
-        let held = pool.checkout(None, soon()).unwrap();
+        let held = pool.checkout(None, soon(), None).unwrap();
         let discarder = Arc::clone(&pool);
         let t = thread::spawn(move || {
             thread::sleep(Duration::from_millis(20));
             discarder.discard(held);
         });
-        assert!(pool.checkout(None, soon()).is_ok());
+        assert!(pool.checkout(None, soon(), None).is_ok());
         t.join().unwrap();
         let st = guest.state();
         assert_eq!((st.logins, st.logouts), (2, 1));
@@ -325,7 +401,7 @@ mod tests {
     fn a_dead_session_is_discarded() {
         let guest = FakeGuest::start();
         let pool = pool(&guest, 1, Duration::from_secs(600));
-        let mut s = pool.checkout(Some("a"), soon()).unwrap();
+        let mut s = pool.checkout(Some("a"), soon(), None).unwrap();
         guest.hangup();
         // The close reaches the client a moment after the guest makes it.
         let until = soon();
@@ -334,7 +410,7 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         pool.checkin(s, Some("a".into()));
-        let _s = pool.checkout(Some("a"), soon()).unwrap();
+        let _s = pool.checkout(Some("a"), soon(), None).unwrap();
         assert_eq!(guest.state().logins, 2);
         assert_eq!(pool.lock().live, 1);
     }
@@ -343,8 +419,8 @@ mod tests {
     fn idle_sessions_are_reaped_and_discards_logged_out() {
         let guest = FakeGuest::start();
         let pool = pool(&guest, 2, Duration::from_millis(20));
-        let old = pool.checkout(None, soon()).unwrap();
-        let busy = pool.checkout(None, soon()).unwrap();
+        let old = pool.checkout(None, soon(), None).unwrap();
+        let busy = pool.checkout(None, soon(), None).unwrap();
         pool.checkin(old, None);
         thread::sleep(Duration::from_millis(30));
         pool.reap();
@@ -352,7 +428,7 @@ mod tests {
         assert_eq!(pool.lock().live, 1);
         // Too fresh to reap.
         let fresh = Pool::new(guest.config(), 1, Duration::from_secs(600), Timing::TEST);
-        let s = fresh.checkout(None, soon()).unwrap();
+        let s = fresh.checkout(None, soon(), None).unwrap();
         fresh.checkin(s, None);
         fresh.reap();
         assert_eq!(guest.state().logouts, 1);

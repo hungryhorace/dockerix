@@ -5,7 +5,9 @@
 #
 # 1. Push mode: boot a VM on workarea/hello, build and run hello.c in RISC
 #    iX, check that an exit status comes back and that `get` fetches the
-#    binary.
+#    binary. `dockerix kill` stops a command on a held session (130) and
+#    one on a session of its own (129), refuses a pid `ps` does not list,
+#    and leaves nothing running in the guest.
 # 2. The live NFS mount: `restart --nfs`, which must sweep orphaned
 #    `.nfsXXXX` files as it starts; an edit on the host reaching `make` in
 #    the guest within a second or two (the attribute cache, `actimeo=1`);
@@ -32,6 +34,20 @@ dockerix() { cargo run --locked -q --manifest-path "$root/cli/Cargo.toml" -- "$@
 fail() {
     echo "smoke: FAILED: $*" >&2
     exit 1
+}
+# The PID `dockerix ps` gives the running command containing $1, once it is
+# listed (a command takes a moment to reach the guest).
+listed_pid() {
+    local pid
+    for _ in $(seq 1 60); do
+        pid=$(dockerix ps | awk -v cmd="$1" '$2 == "running" && index($0, cmd) { print $1; exit }')
+        if [ -n "$pid" ]; then
+            echo "$pid"
+            return
+        fi
+        sleep 0.5
+    done
+    fail "dockerix ps never listed '$1' as running"
 }
 
 # One VM per Docker host (`dockerix-vm`). In CI one left behind by an
@@ -76,6 +92,41 @@ dockerix exec sh -c 'exit 3' || rc=$?
 
 dockerix get hello
 [ -s hello ] || fail "get hello: nothing arrived"
+
+# `dockerix kill`, as from another terminal. A command on a held session is
+# interrupted: 130, its client told why, and it does not run on.
+dockerix exec sh -c 'echo started; sleep 57; echo finished' >"$scratch/held.out" 2>"$scratch/held.err" &
+held=$!
+pid=$(listed_pid 'sleep 57')
+dockerix kill "$pid"
+rc=0
+wait "$held" || rc=$?
+[ "$rc" -eq 130 ] || fail "the killed command exited $rc, not 130"
+grep -q 'stopped by dockerix kill' "$scratch/held.err" || fail "the killed command's client was not told: $(cat "$scratch/held.err")"
+if grep -q finished "$scratch/held.out"; then fail "the killed command ran on"; fi
+# A command on a session of its own (as `exec -t` and `login` are) is hung
+# up: its `rix` dies of SIGHUP, 129.
+DOCKERIX_DIRECT=1 dockerix exec sleep 58 >/dev/null 2>&1 &
+direct=$!
+pid=$(listed_pid 'sleep 58')
+dockerix kill "$pid"
+rc=0
+wait "$direct" || rc=$?
+[ "$rc" -eq 129 ] || fail "the hung-up command exited $rc, not 129"
+# A pid `ps` does not list is refused.
+if dockerix kill 99999 2>/dev/null; then fail "kill of a pid ps does not list succeeded"; fi
+# Nothing is left: not in `ps`, and not in the guest, which hangs a session
+# up in its own time, so give it a few seconds.
+for _ in $(seq 1 20); do
+    listed=$(dockerix ps)
+    procs=$(dockerix exec --no-sync ps ax)
+    if grep -q '^nothing running in the guest$' <<<"$listed" && ! grep -q 'sleep 5[78]' <<<"$procs"; then
+        break
+    fi
+    sleep 0.5
+done
+grep -q '^nothing running in the guest$' <<<"$listed" || fail "dockerix ps after the kills: $listed"
+if grep -q 'sleep 5[78]' <<<"$procs"; then fail "a killed command still runs in the guest: $procs"; fi
 
 # Phase 2: the live NFS mount, on the same work area and state.
 

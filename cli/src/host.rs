@@ -525,14 +525,30 @@ fn guest_mount(table: Option<&str>, guest_wa: &str) -> String {
 /// `dockerix ps`: what dockerix is running in the guest, as the agent
 /// lists it.
 pub fn ps() -> io::Result<i32> {
+    agent_command(&["ps"])
+}
+
+/// `dockerix kill`: stop what the agent lists under these pids.
+pub fn kill(pids: &[u32]) -> io::Result<i32> {
+    let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
+    let args: Vec<&str> = ["kill"].into_iter().chain(pids.iter().map(String::as_str)).collect();
+    agent_command(&args)
+}
+
+/// `dockerix agent <args>` in the running container, its output passed
+/// through; its exit code.
+fn agent_command(args: &[&str]) -> io::Result<i32> {
     match inspect_state()? {
         State::Running { .. } => {}
         State::Absent | State::Stopped(_) => {
             return Err(io::Error::other(format!("{CONTAINER} is not running (dockerix start)")));
         }
     }
-    let status =
-        docker().args(["exec", CONTAINER, "dockerix", "agent", "ps"]).status().map_err(docker_missing)?;
+    let status = docker()
+        .args(["exec", CONTAINER, "dockerix", "agent"])
+        .args(args)
+        .status()
+        .map_err(docker_missing)?;
     Ok(child_code(status, FAILURE))
 }
 

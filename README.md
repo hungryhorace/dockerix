@@ -149,7 +149,8 @@ dockerix put [-r] <host-path> [guest-path]   the reverse ('-' for stdin/stdout)
 dockerix sync           push work-area changes now, running nothing
 dockerix sync --clear   empty the guest work area first, then push it all afresh
 dockerix run [start options] <cmd>   one-shot for CI: start, run, stop
-dockerix ps             what dockerix is running in the guest, and for how long
+dockerix ps             what dockerix is running in the guest, by PID, and for how long
+dockerix kill PID…      stop what ps lists (a command as by Ctrl-C; exec -t, login hung up)
 dockerix console        the noVNC console in the browser (none after --no-vnc)
 dockerix x11            host-side relay for guest X clients (needs start --x11)
 dockerix reset          discard the guest disc and CMOS (the next start re-seeds them)

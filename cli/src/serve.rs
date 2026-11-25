@@ -32,7 +32,14 @@
 //! `count`, just how many), then `x`. `n` (notice) carries
 //! `phase\tdir\tcommand` from a `rix` that runs a session of its own (`exec
 //! -t`, `login`, a direct command): the server lists it until that `rix`
-//! closes the connection, and replies nothing.
+//! closes the connection, and replies nothing. Either way the list names
+//! the in-container process that connected, by the pid the socket's peer
+//! credentials give (`SO_PEERCRED`), so no frame carries it. `K` (kill)
+//! carries such a pid (`dockerix kill`): a command on a held session is
+//! interrupted as by Ctrl-C, and its client told why; an announced session's
+//! `rix` is hung up (SIGHUP), so the guest hangs up its shell. The reply is
+//! a line saying which as `o`, then `x`; a pid `dockerix ps` does not list
+//! gets `e`, then `x` 1.
 //!
 //! Interrupting: `docker exec` does not forward signals, so Ctrl-C on the host
 //! only kills the docker client and the command would run on. The host
@@ -54,6 +61,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rustix::process::{Pid, Signal, kill_process};
+
 use crate::config::{self, Config};
 use crate::exec;
 use crate::session::Timing;
@@ -62,6 +71,7 @@ mod activity;
 mod pool;
 
 pub use activity::Phase;
+use activity::{Killed, Stop};
 use pool::Pool;
 
 /// A non-tty command to run in the guest.
@@ -128,6 +138,8 @@ enum Incoming {
     List { count: bool },
     /// A `rix` running a session of its own, listed until it hangs up.
     Notice(activity::Entry),
+    /// Stop what this pid asked for (`dockerix kill`).
+    Kill(String),
 }
 
 pub fn socket_path() -> String {
@@ -257,6 +269,25 @@ pub fn client_list(path: &str, count: bool) -> io::Result<String> {
     }
 }
 
+/// Ask the server at `path` to stop what `pid` asked for (`dockerix kill`):
+/// the line saying what it did, or an error naming a pid it does not list.
+pub fn client_kill(path: &str, pid: u32) -> io::Result<String> {
+    let mut s = UnixStream::connect(path)?;
+    write_frame(&mut s, b'K', pid.to_string().as_bytes())?;
+    let mut said = Vec::new();
+    loop {
+        match read_frame(&mut s)? {
+            Some((b'o', data)) => said.extend_from_slice(&data),
+            Some((b'e', msg)) => return Err(io::Error::other(String::from_utf8_lossy(&msg).into_owned())),
+            Some((b'x', _)) => return Ok(String::from_utf8_lossy(&said).into_owned()),
+            Some(_) => {}
+            None => {
+                return Err(io::Error::new(ErrorKind::UnexpectedEof, "the agent closed the exec socket"));
+            }
+        }
+    }
+}
+
 /// Tell the server at `path` about a session this `rix` runs itself, so
 /// `dockerix ps` lists it. It stays listed while the returned connection is
 /// open: hold it for the session's life. None when there is no server (a
@@ -354,6 +385,7 @@ fn read_request(stream: &mut UnixStream) -> io::Result<Incoming> {
             b'a' => return Ok(Incoming::Abort(text)),
             b'l' => return Ok(Incoming::List { count: text == "count" }),
             b'n' => return notice(&text).map(Incoming::Notice),
+            b'K' => return Ok(Incoming::Kill(text)),
             other => {
                 return Err(io::Error::new(
                     ErrorKind::InvalidData,
@@ -364,7 +396,57 @@ fn read_request(stream: &mut UnixStream) -> io::Result<Incoming> {
     }
 }
 
-/// An `n` frame's `phase\tdir\tcommand`, as an entry starting now.
+/// The pid of the process at the other end of `stream`: the in-container
+/// `rix` (or `dockerix agent`) that asked, for `dockerix ps`. Only Linux
+/// says (`SO_PEERCRED`); the agent runs nowhere else, so elsewhere, in
+/// tests, there is none. Both ends share the container's pid namespace.
+#[cfg(target_os = "linux")]
+fn peer_pid(stream: &UnixStream) -> Option<u32> {
+    let cred = rustix::net::sockopt::socket_peercred(stream).ok()?;
+    u32::try_from(cred.pid.as_raw_pid()).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peer_pid(_stream: &UnixStream) -> Option<u32> {
+    None
+}
+
+/// `dockerix kill`: stop what the pid in `text` asked for. Ok is what was
+/// done, a line an entry, for the user; Err says why nothing was.
+fn kill(activity: &activity::Activity, text: &str) -> Result<String, String> {
+    let pid: u32 = text.trim().parse().map_err(|_| format!("{text:?} is not a pid"))?;
+    let killed = activity.kill(pid);
+    if killed.is_empty() {
+        return Err(format!("no PID {pid} in dockerix ps"));
+    }
+    let mut said = String::new();
+    for k in killed {
+        let line = match k {
+            Killed::Interrupted(e) => format!("{pid}: interrupting {}", e.shown()),
+            Killed::HangUp(e) => match hang_up(pid) {
+                Ok(()) => format!("{pid}: hung up {}", e.shown()),
+                Err(err) => return Err(format!("could not hang up {pid}: {err}")),
+            },
+        };
+        said.push_str(&line);
+        said.push('\n');
+    }
+    Ok(said)
+}
+
+/// SIGHUP to the in-container `rix` with `pid`: its telnet connection closes
+/// and the guest hangs up the session. Never to the agent itself, which
+/// would stop the container (and which a test's socket pair names).
+fn hang_up(pid: u32) -> io::Result<()> {
+    if pid == std::process::id() {
+        return Err(io::Error::other("that is the agent itself"));
+    }
+    let pid = i32::try_from(pid).ok().and_then(Pid::from_raw).ok_or_else(|| io::Error::other("not a pid"))?;
+    Ok(kill_process(pid, Signal::HUP)?)
+}
+
+/// An `n` frame's `phase\tdir\tcommand`, as an entry starting now (with no
+/// pid yet: `serve_one` has the socket).
 fn notice(text: &str) -> io::Result<activity::Entry> {
     let mut f = text.splitn(3, '\t');
     let (phase, dir, command) = (f.next().unwrap_or(""), f.next(), f.next());
@@ -374,12 +456,14 @@ fn notice(text: &str) -> io::Result<activity::Entry> {
             dir: dir.to_string(),
             phase,
             started: Instant::now(),
+            pid: None,
         }),
         _ => Err(io::Error::new(ErrorKind::InvalidData, format!("bad notice {text:?}"))),
     }
 }
 
 fn serve_one(pool: Arc<Pool>, mut stream: UnixStream) {
+    let pid = peer_pid(&stream);
     let req = match read_request(&mut stream) {
         Ok(Incoming::Run(r)) => r,
         Ok(Incoming::Abort(id)) => {
@@ -402,9 +486,20 @@ fn serve_one(pool: Arc<Pool>, mut stream: UnixStream) {
         }
         Ok(Incoming::Notice(entry)) => {
             // Listed until the announcing `rix` hangs up (or dies).
-            let _tracked = pool.activity.track(entry);
+            let _tracked = pool.activity.track(activity::Entry { pid, ..entry }, Stop::HangUp);
             let mut buf = [0u8; 64];
             while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+            return;
+        }
+        Ok(Incoming::Kill(text)) => {
+            let (kind, said, code) = match kill(&pool.activity, &text) {
+                Ok(said) => (b'o', said, &b"0"[..]),
+                Err(why) => (b'e', why, &b"1"[..]),
+            };
+            // A killed run may be waiting for a session.
+            pool.wake_waiters();
+            let _ = write_frame(&mut stream, kind, said.as_bytes());
+            let _ = write_frame(&mut stream, b'x', code);
             return;
         }
         Err(e) => {
@@ -425,10 +520,12 @@ fn serve_one(pool: Arc<Pool>, mut stream: UnixStream) {
         None => Arc::new(AtomicBool::new(false)),
     };
     // The client closing its socket mid-command (the in-container `rix`
-    // killed) also counts as an interrupt. Reads on the clone unblock when
-    // serve_one shuts the socket down at the end.
+    // killed) also counts as an interrupt, waiting for a session included.
+    // Reads on the clone unblock when serve_one shuts the socket down at the
+    // end.
     if let Ok(mut watch) = stream.try_clone() {
         let flag = Arc::clone(&interrupt);
+        let pool = Arc::clone(&pool);
         thread::spawn(move || {
             let mut buf = [0u8; 64];
             loop {
@@ -438,17 +535,22 @@ fn serve_one(pool: Arc<Pool>, mut stream: UnixStream) {
                 }
             }
             flag.store(true, Ordering::SeqCst);
+            pool.wake_waiters();
         });
     }
     let deadline = Instant::now() + Duration::from_secs(req.timeout_secs);
-    let tracked = pool.activity.track(activity::Entry {
-        command: req.display.clone().unwrap_or_else(|| req.command.clone()),
-        dir: req.dir.clone().unwrap_or_default(),
-        phase: Phase::Waiting,
-        started: Instant::now(),
-    });
+    let tracked = pool.activity.track(
+        activity::Entry {
+            command: req.display.clone().unwrap_or_else(|| req.command.clone()),
+            dir: req.dir.clone().unwrap_or_default(),
+            phase: Phase::Waiting,
+            started: Instant::now(),
+            pid,
+        },
+        Stop::Interrupt(Arc::clone(&interrupt)),
+    );
     let result = (|| {
-        let mut session = pool.checkout(req.key.as_deref(), deadline)?;
+        let mut session = pool.checkout(req.key.as_deref(), deadline, Some(&interrupt))?;
         tracked.set_phase(if req.sync { Phase::Pushing } else { Phase::Running });
         // If the client goes away mid-command, keep going: the session must
         // reach a known state to stay usable, so socket writes are best effort.
@@ -493,13 +595,25 @@ fn serve_one(pool: Arc<Pool>, mut stream: UnixStream) {
             }
         }
     })();
+    let killed = tracked.killed();
     drop(tracked);
     if let Some(id) = &req.id {
         pool.unregister(id);
     }
+    if killed {
+        let _ = write_frame(&mut stream, b'e', b"rix: stopped by dockerix kill");
+    }
     match result {
         Ok(code) => {
             let _ = write_frame(&mut stream, b'x', code.to_string().as_bytes());
+        }
+        // Stopped while waiting for a session: as a run interrupted later
+        // would be, 130, and said once.
+        Err(e) if e.kind() == ErrorKind::Interrupted && interrupt.load(Ordering::SeqCst) => {
+            if !killed {
+                let _ = write_frame(&mut stream, b'e', format!("rix: {e}").as_bytes());
+            }
+            let _ = write_frame(&mut stream, b'x', b"130");
         }
         Err(e) => {
             let _ = write_frame(&mut stream, b'e', format!("rix: {e}").as_bytes());
@@ -664,6 +778,10 @@ mod tests {
                 assert!(Instant::now() < until, "the notice was never listed");
                 thread::sleep(Duration::from_millis(2));
             }
+            // Both ends of each socket pair are this process: on Linux the
+            // run and the notice are named by our pid, elsewhere by none.
+            let own = cfg!(target_os = "linux").then(std::process::id);
+            assert!(pool.activity.list().iter().all(|e| e.pid == own), "{:?}", pool.activity.list());
             let table = serve(&pool, &[(b'l', b"")], |_| {});
             let text = &table[0].1;
             assert!(text.contains("running") && text.contains("/wa") && text.contains("make all"), "{text}");
@@ -786,6 +904,130 @@ mod tests {
             client.shutdown(Shutdown::Write).unwrap();
         });
         assert_eq!(replies.last(), Some(&(b'x', "130".into())));
+    }
+
+    /// Serve `run` in a thread of its own, once `pool`'s only session is
+    /// busy, and wait until it is listed as waiting for one.
+    fn serve_waiting(
+        pool: &Arc<Pool>,
+        run: &'static [(u8, &'static [u8])],
+    ) -> thread::JoinHandle<Vec<(u8, String)>> {
+        let p = Arc::clone(pool);
+        let waiting = thread::spawn(move || serve(&p, run, |_| {}));
+        let until = soon();
+        while !pool.activity.list().iter().any(|e| e.phase == Phase::Waiting) {
+            assert!(Instant::now() < until, "the run never waited");
+            thread::sleep(Duration::from_millis(2));
+        }
+        waiting
+    }
+
+    #[test]
+    fn an_abort_stops_a_run_waiting_for_a_session() {
+        let guest = hanging();
+        let pool = pool(&guest, 1, Duration::from_secs(600));
+        let busy = [(b'c', &b"hang"[..]), (b's', b"0"), (b'i', b"r1"), (b'g', b"")];
+        let replies = serve(&pool, &busy, |_| {
+            assert!(guest.wait(|st| st.commands.last().map(String::as_str) == Some("hang")));
+            let waiting = serve_waiting(&pool, &[(b'c', b"make"), (b's', b"1"), (b'i', b"r2"), (b'g', b"")]);
+            let asked = Instant::now();
+            serve(&pool, &[(b'a', b"r2")], |_| {});
+            assert_eq!(
+                waiting.join().unwrap(),
+                [(b'e', "rix: interrupted while waiting for a guest session".into()), (b'x', "130".into())]
+            );
+            assert!(asked.elapsed() < Duration::from_secs(5), "waited {:?}", asked.elapsed());
+            serve(&pool, &[(b'a', b"r1")], |_| {});
+        });
+        assert_eq!(replies.last(), Some(&(b'x', "130".into())));
+        assert!(!guest.state().commands.iter().any(|c| c == "make"), "{:?}", guest.state().commands);
+    }
+
+    #[test]
+    fn a_kill_names_a_pid_ps_lists() {
+        let guest = hanging();
+        let pool = pool(&guest, 1, Duration::from_secs(600));
+        assert_eq!(
+            serve(&pool, &[(b'K', b"4321")], |_| {}),
+            [(b'e', "no PID 4321 in dockerix ps".into()), (b'x', "1".into())]
+        );
+        assert_eq!(
+            serve(&pool, &[(b'K', b"ninety")], |_| {}),
+            [(b'e', "\"ninety\" is not a pid".into()), (b'x', "1".into())]
+        );
+    }
+
+    // The two below name entries by our own pid: both ends of each socket
+    // pair are this process, and only Linux gives a peer's pid.
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_kill_interrupts_a_run_and_tells_its_client() {
+        let guest = hanging();
+        let pool = pool(&guest, 1, Duration::from_secs(600));
+        let own = std::process::id();
+        let run = [(b'c', &b"hang"[..]), (b's', b"0"), (b'd', b"hang about"), (b'g', b"")];
+        let replies = serve(&pool, &run, |_| {
+            assert!(guest.wait(|st| st.commands.last().map(String::as_str) == Some("hang")));
+            assert_eq!(
+                serve(&pool, &[(b'K', own.to_string().as_bytes())], |_| {}),
+                [(b'o', format!("{own}: interrupting hang about\n")), (b'x', "0".into())]
+            );
+        });
+        assert_eq!(
+            replies[replies.len() - 2..],
+            [(b'e', "rix: stopped by dockerix kill".into()), (b'x', "130".into())]
+        );
+        // Interrupted cleanly, the session goes back to the pool.
+        assert_eq!(pool.lock().idle.len(), 1);
+    }
+
+    /// Both runs are this process, so the kill stops both: the waiting one
+    /// without ever running, and saying so once.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_kill_stops_a_run_waiting_for_a_session() {
+        let guest = hanging();
+        let pool = pool(&guest, 1, Duration::from_secs(600));
+        let own = std::process::id();
+        let busy = [(b'c', &b"hang"[..]), (b's', b"0"), (b'g', b"")];
+        let replies = serve(&pool, &busy, |_| {
+            assert!(guest.wait(|st| st.commands.last().map(String::as_str) == Some("hang")));
+            let waiting = serve_waiting(&pool, &[(b'c', b"make"), (b's', b"1"), (b'g', b"")]);
+            assert_eq!(
+                serve(&pool, &[(b'K', own.to_string().as_bytes())], |_| {}),
+                [(b'o', format!("{own}: interrupting hang\n{own}: interrupting make\n")), (b'x', "0".into())]
+            );
+            assert_eq!(
+                waiting.join().unwrap(),
+                [(b'e', "rix: stopped by dockerix kill".into()), (b'x', "130".into())]
+            );
+        });
+        assert_eq!(replies.last(), Some(&(b'x', "130".into())));
+        assert!(!guest.state().commands.iter().any(|c| c == "make"), "{:?}", guest.state().commands);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_kill_never_hangs_up_the_agent_itself() {
+        let guest = hanging();
+        let pool = pool(&guest, 1, Duration::from_secs(600));
+        let (mut note, server) = UnixStream::pair().unwrap();
+        let p = Arc::clone(&pool);
+        let noticed = thread::spawn(move || serve_one(p, server));
+        write_frame(&mut note, b'n', b"login\t/\t").unwrap();
+        let until = soon();
+        while pool.activity.list().is_empty() {
+            assert!(Instant::now() < until, "the notice was never listed");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let own = std::process::id();
+        assert_eq!(
+            serve(&pool, &[(b'K', own.to_string().as_bytes())], |_| {}),
+            [(b'e', format!("could not hang up {own}: that is the agent itself")), (b'x', "1".into())]
+        );
+        drop(note);
+        noticed.join().unwrap();
     }
 
     #[test]

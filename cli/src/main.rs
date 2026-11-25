@@ -177,9 +177,18 @@ enum Top {
     },
     /// What dockerix is running in the guest: commands, `exec -t` and
     /// logins, with how long each has run and whether a command is still
-    /// waiting for a session or pushing the work area. Not the guest's own
-    /// processes (`dockerix exec ps` lists those).
+    /// waiting for a session or pushing the work area. Each is named by the
+    /// pid of the `rix` that asked for it in the container (PID). Not the
+    /// guest's own processes (`dockerix exec ps` lists those).
     Ps,
+    /// Stop what `dockerix ps` lists under PID, from any terminal: a command
+    /// is interrupted as by Ctrl-C where it was started (and told why); an
+    /// `exec -t` or login is hung up, as if its terminal had gone away.
+    Kill {
+        /// PIDs as `dockerix ps` shows them.
+        #[arg(required = true)]
+        pids: Vec<u32>,
+    },
     /// Open the noVNC console in the browser.
     Console,
     /// Interactive root shell in the guest.
@@ -386,6 +395,11 @@ enum AgentCmd {
         #[arg(long)]
         count: bool,
     },
+    /// Stop what these pids asked for (`dockerix kill`).
+    Kill {
+        #[arg(required = true)]
+        pids: Vec<u32>,
+    },
     /// Container half of `dockerix get`: fetch a guest path into the work
     /// area (relative destination) or, with none, as a tar on stdout.
     Get {
@@ -455,6 +469,7 @@ fn main() {
         Top::Restart(agent) => host_exit(host::restart(&agent.settings())),
         Top::Status { verbose } => host_exit(host::status(verbose)),
         Top::Ps => host_exit(host::ps()),
+        Top::Kill { pids } => host_exit(host::kill(&pids)),
         Top::Console => host_exit(host::console()),
         Top::Login(a) => host_exit(host::login(a.workdir, plain)),
         Top::Exec(a) => host_exit(host::exec(a.tty, a.no_sync, a.run.options(a.workdir), a.command, plain)),
@@ -515,6 +530,20 @@ fn main() {
                     exit(1);
                 }
             },
+            AgentCmd::Kill { pids } => {
+                // Every pid is tried; any refused makes the exit 1, as kill(1).
+                let mut code = 0;
+                for pid in pids {
+                    match serve::client_kill(&serve::socket_path(), pid) {
+                        Ok(said) => out!("{said}"),
+                        Err(e) => {
+                            eprintln!("dockerix kill: {e}");
+                            code = 1;
+                        }
+                    }
+                }
+                exit(code);
+            }
             AgentCmd::Nfs => {
                 nfs_server::check();
                 exit(0)
